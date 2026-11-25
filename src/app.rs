@@ -2452,8 +2452,8 @@ impl TabManagerApp {
                         );
                         let resp = ui.interact(
                             mid_rect,
-                            ui.id().with(("list_row_mid", pane_idx, &entry.path)),
-                            Sense::click_and_drag(),
+                            ui.scope_id().with(("list_row_mid", pane_idx, &entry.path)),
+                            Sense::click(),
                         );
 
                         if resp.is_pointer_button_down_on() && self.long_press.is_none() {
@@ -2596,8 +2596,8 @@ impl TabManagerApp {
                                 );
                                 let resp = ui.interact(
                                     body_rect,
-                                    ui.id().with(("grid_tile_body", pane_idx, &entry.path)),
-                                    Sense::click_and_drag(),
+                                    ui.scope_id().with(("grid_tile_body", pane_idx, &entry.path)),
+                                    Sense::click(),
                                 );
 
                                 if resp.is_pointer_button_down_on() && self.long_press.is_none() {
