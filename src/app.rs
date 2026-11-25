@@ -105,7 +105,6 @@ struct DecodedThumb {
 }
 
 struct LongPressTracker {
-    pane: usize,
     entry: FileEntry,
     started_at: Instant,
     start_pos: egui::Pos2,
@@ -2209,7 +2208,6 @@ impl TabManagerApp {
         let mut open_target: Option<FileEntry> = None;
         let mut toggle_select: Option<PathBuf> = None;
         let mut set_active = false;
-        let mut context_action: Option<(String, FileEntry)> = None;
         let mut long_press_open: Option<FileEntry> = None;
         let mut sort_click: Option<SortBy> = None;
         let pointer_down = ui.input(|i| i.pointer.primary_down());
@@ -2319,23 +2317,24 @@ impl TabManagerApp {
                         } else {
                             Color32::TRANSPARENT
                         };
-                        let mut cb_clicked = false;
-                        let mut menu_interacted = false;
+                        let mut cb_rect = Rect::NOTHING;
+                        let mut menu_rect = Rect::NOTHING;
 
-                        let resp = Frame::NONE
+                        let frame_resp = Frame::NONE
                             .fill(row_bg)
                             .corner_radius(CornerRadius::same(10))
                             .inner_margin(Margin::symmetric(10, 6))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    // Dedicated left selection square (never conflicts with row tap!)
-                                    if draw_select_box(ui, is_sel, p) {
-                                        cb_clicked = true;
+                                    // 1. Dedicated left selection square (non-overlapped!)
+                                    let cb_resp = draw_select_box(ui, is_sel, p);
+                                    cb_rect = cb_resp.rect;
+                                    if cb_resp.clicked() {
                                         toggle_select = Some(entry.path.clone());
                                         set_active = true;
                                     }
 
-                                    // Real image thumbnail OR crisp vector category badge
+                                    // 2. Real image thumbnail OR crisp vector category badge
                                     if let Some(tex) = self.thumbs.get(&entry.path) {
                                         let (r, _) =
                                             ui.allocate_exact_size(vec2(38.0, 38.0), Sense::hover());
@@ -2398,9 +2397,9 @@ impl TabManagerApp {
                                         }
                                     });
 
-                                    // Right-aligned columns + Action Sheet trigger button
+                                    // 3. Right-aligned columns + Action Sheet trigger button
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if icon_button(
+                                        let m_resp = icon_button(
                                             ui,
                                             Icon::MoreVert,
                                             false,
@@ -2409,10 +2408,9 @@ impl TabManagerApp {
                                             p.accent_soft,
                                             p.text_muted,
                                             p.text_primary,
-                                        )
-                                        .clicked()
-                                        {
-                                            menu_interacted = true;
+                                        );
+                                        menu_rect = m_resp.rect;
+                                        if m_resp.clicked() {
                                             long_press_open = Some(entry.clone());
                                         }
 
@@ -2442,26 +2440,35 @@ impl TabManagerApp {
                                     });
                                 });
                             })
-                            .response
-                            .interact(Sense::click_and_drag());
+                            .response;
 
-                        // Start long-press timer when user holds down on a row
-                        if !cb_clicked && !menu_interacted && resp.is_pointer_button_down_on() {
-                            if self.long_press.is_none() {
-                                if let Some(pos) = pointer_pos {
-                                    self.long_press = Some(LongPressTracker {
-                                        pane: pane_idx,
-                                        entry: entry.clone(),
-                                        started_at: Instant::now(),
-                                        start_pos: pos,
-                                        fired: false,
-                                    });
-                                    ctx.request_repaint_after(Duration::from_millis(40));
-                                }
+                        // Interactive hit region ONLY between checkbox and menu button — zero overlap!
+                        let row_rect = frame_resp.rect;
+                        let mid_left = (cb_rect.right() + 4.0).min(row_rect.right());
+                        let mid_right = (menu_rect.left() - 4.0).max(mid_left);
+                        let mid_rect = Rect::from_min_max(
+                            egui::pos2(mid_left, row_rect.top()),
+                            egui::pos2(mid_right, row_rect.bottom()),
+                        );
+                        let resp = ui.interact(
+                            mid_rect,
+                            ui.id().with(("list_row_mid", pane_idx, &entry.path)),
+                            Sense::click_and_drag(),
+                        );
+
+                        if resp.is_pointer_button_down_on() && self.long_press.is_none() {
+                            if let Some(pos) = pointer_pos {
+                                self.long_press = Some(LongPressTracker {
+                                    entry: entry.clone(),
+                                    started_at: Instant::now(),
+                                    start_pos: pos,
+                                    fired: false,
+                                });
+                                ctx.request_repaint_after(Duration::from_millis(40));
                             }
                         }
 
-                        if !cb_clicked && !menu_interacted && !suppress_click_for_long_press {
+                        if !suppress_click_for_long_press {
                             if resp.clicked() {
                                 set_active = true;
                                 if !self.panes[pane_idx].selected.is_empty() {
@@ -2492,10 +2499,9 @@ impl TabManagerApp {
                             for entry in chunk {
                                 let is_sel = self.panes[pane_idx].selected.contains(&entry.path);
                                 let cat_color = Palette::category_color(entry.category);
-                                let mut cb_clicked = false;
-                                let mut menu_interacted = false;
+                                let mut header_bottom = 0.0f32;
 
-                                let resp = Frame::NONE
+                                let frame_resp = Frame::NONE
                                     .fill(if is_sel { p.bg_selected } else { p.bg_surface })
                                     .corner_radius(CornerRadius::same(16))
                                     .stroke(Stroke::new(
@@ -2506,9 +2512,8 @@ impl TabManagerApp {
                                     .show(ui, |ui| {
                                         ui.set_width(tile_w - 20.0);
                                         ui.set_height(142.0);
-                                        ui.horizontal(|ui| {
-                                            if draw_select_box(ui, is_sel, p) {
-                                                cb_clicked = true;
+                                        let hdr = ui.horizontal(|ui| {
+                                            if draw_select_box(ui, is_sel, p).clicked() {
                                                 toggle_select = Some(entry.path.clone());
                                                 set_active = true;
                                             }
@@ -2527,12 +2532,13 @@ impl TabManagerApp {
                                                     )
                                                     .clicked()
                                                     {
-                                                        menu_interacted = true;
                                                         long_press_open = Some(entry.clone());
                                                     }
                                                 },
                                             );
                                         });
+                                        header_bottom = hdr.response.rect.bottom();
+
                                         ui.vertical_centered(|ui| {
                                             if let Some(tex) = self.thumbs.get(&entry.path) {
                                                 let (r, _) = ui.allocate_exact_size(
@@ -2579,26 +2585,34 @@ impl TabManagerApp {
                                             );
                                         });
                                     })
-                                    .response
-                                    .interact(Sense::click_and_drag());
+                                    .response;
 
-                                if !cb_clicked && !menu_interacted && resp.is_pointer_button_down_on()
-                                {
-                                    if self.long_press.is_none() {
-                                        if let Some(pos) = pointer_pos {
-                                            self.long_press = Some(LongPressTracker {
-                                                pane: pane_idx,
-                                                entry: entry.clone(),
-                                                started_at: Instant::now(),
-                                                start_pos: pos,
-                                                fired: false,
-                                            });
-                                            ctx.request_repaint_after(Duration::from_millis(40));
-                                        }
+                                // Interactive body ONLY below the top checkbox/menu header — zero overlap!
+                                let tile_rect = frame_resp.rect;
+                                let body_top = (header_bottom + 2.0).min(tile_rect.bottom());
+                                let body_rect = Rect::from_min_max(
+                                    egui::pos2(tile_rect.left(), body_top),
+                                    tile_rect.max,
+                                );
+                                let resp = ui.interact(
+                                    body_rect,
+                                    ui.id().with(("grid_tile_body", pane_idx, &entry.path)),
+                                    Sense::click_and_drag(),
+                                );
+
+                                if resp.is_pointer_button_down_on() && self.long_press.is_none() {
+                                    if let Some(pos) = pointer_pos {
+                                        self.long_press = Some(LongPressTracker {
+                                            entry: entry.clone(),
+                                            started_at: Instant::now(),
+                                            start_pos: pos,
+                                            fired: false,
+                                        });
+                                        ctx.request_repaint_after(Duration::from_millis(40));
                                     }
                                 }
 
-                                if !cb_clicked && !menu_interacted && !suppress_click_for_long_press {
+                                if !suppress_click_for_long_press {
                                     if resp.clicked() {
                                         set_active = true;
                                         if !self.panes[pane_idx].selected.is_empty() {
@@ -2639,9 +2653,6 @@ impl TabManagerApp {
             });
         } else if let Some(entry) = open_target {
             self.open_entry(pane_idx, &entry, ctx);
-        }
-        if let Some((action, entry)) = context_action {
-            self.execute_entry_action(pane_idx, &action, entry, ctx);
         }
     }
 
@@ -3814,8 +3825,8 @@ impl TabManagerApp {
     }
 }
 
-fn draw_select_box(ui: &mut egui::Ui, selected: bool, p: &Palette) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
+fn draw_select_box(ui: &mut egui::Ui, selected: bool, p: &Palette) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(38.0, 38.0), Sense::click());
     let box_rect = Rect::from_center_size(rect.center(), vec2(22.0, 22.0));
     if selected {
         ui.painter()
@@ -3841,7 +3852,7 @@ fn draw_select_box(ui: &mut egui::Ui, selected: bool, p: &Palette) -> bool {
             egui::StrokeKind::Inside,
         );
     }
-    resp.clicked()
+    resp
 }
 
 fn truncate_middle(s: &str, max_chars: usize) -> String {
