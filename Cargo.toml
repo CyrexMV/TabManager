@@ -1,6 +1,6 @@
 [package]
 name = "tabmanager"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "High-End Rust File Manager for Galaxy Tab S12 Ultra (eframe + egui + wgpu)"
 license = "MIT"

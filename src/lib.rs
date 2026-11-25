@@ -1,6 +1,7 @@
 pub mod android_bridge;
 pub mod app;
 pub mod fs_ops;
+pub mod icons;
 pub mod model;
 pub mod prefs;
 pub mod theme;
@@ -38,8 +39,7 @@ mod android_entry {
             "TabManager",
             options,
             Box::new(move |cc| {
-                // Slightly upscale typography for high-DPI tablet readability
-                cc.egui_ctx.set_zoom_factor(1.1);
+                crate::theme::install_fonts(&cc.egui_ctx);
                 Ok(Box::new(TabManagerApp::new(bridge, data_dir)))
             }),
         );

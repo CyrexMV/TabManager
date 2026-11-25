@@ -18,7 +18,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "TabManager",
         options,
-        Box::new(move |_cc| Ok(Box::new(TabManagerApp::new(bridge, config_dir)))),
+        Box::new(move |cc| {
+            tabmanager::theme::install_fonts(&cc.egui_ctx);
+            Ok(Box::new(TabManagerApp::new(bridge, config_dir)))
+        }),
     )
 }
 

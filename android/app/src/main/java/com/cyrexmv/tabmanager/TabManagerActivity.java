@@ -40,6 +40,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class TabManagerActivity extends NativeActivity {
 
     private final AtomicBoolean backPressed = new AtomicBoolean(false);
+    private volatile int insetTop = 0;
+    private volatile int insetBottom = 0;
+    private volatile int insetLeft = 0;
+    private volatile int insetRight = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -51,12 +55,32 @@ public class TabManagerActivity extends NativeActivity {
 
         requestHighRefreshRate();
 
+        if (Build.VERSION.SDK_INT >= 30) {
+            getWindow().getDecorView().setOnApplyWindowInsetsListener((v, insets) -> {
+                android.graphics.Insets bars = insets.getInsets(
+                        android.view.WindowInsets.Type.systemBars()
+                                | android.view.WindowInsets.Type.displayCutout()
+                                | android.view.WindowInsets.Type.captionBar()
+                );
+                insetTop = bars.top;
+                insetBottom = bars.bottom;
+                insetLeft = bars.left;
+                insetRight = bars.right;
+                return v.onApplyWindowInsets(insets);
+            });
+            getWindow().getDecorView().requestApplyInsets();
+        }
+
         if (Build.VERSION.SDK_INT >= 33) {
             getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
                     OnBackInvokedDispatcher.PRIORITY_DEFAULT,
                     () -> backPressed.set(true)
             );
         }
+    }
+
+    public String getSystemInsetsEncoded() {
+        return insetTop + "," + insetBottom + "," + insetLeft + "," + insetRight;
     }
 
     @Override

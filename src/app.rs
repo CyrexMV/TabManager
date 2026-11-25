@@ -1,5 +1,6 @@
 use crate::android_bridge::PlatformBridge;
 use crate::fs_ops;
+use crate::icons::{category_icon_badge, icon_button, icon_widget, paint_icon, pill_button, Icon};
 use crate::model::{
     format_size, format_timestamp, BgJobHandle, ClipboardAction, ClipboardState, FileCategory,
     FileEntry, Location, PaneState, SortBy, SortOrder, SpecialView, StorageInfo, TabState,
@@ -10,11 +11,12 @@ use crate::theme::{apply_theme, Palette};
 use crate::trash;
 use crate::zip_ops;
 use egui::{
-    Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, ScrollArea, Sense, Stroke,
-    TextureHandle, Vec2,
+    vec2, Align, Color32, CornerRadius, Frame, Layout, Margin, Rect, RichText, ScrollArea, Sense,
+    Shadow, Stroke, TextureHandle, Vec2,
 };
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 enum DialogState {
@@ -27,7 +29,6 @@ enum DialogState {
         name: String,
     },
     Rename {
-        pane: usize,
         target: PathBuf,
         new_name: String,
     },
@@ -88,6 +89,11 @@ struct InspectorExtra {
     folder_stats: Option<(u64, usize)>,
 }
 
+struct DecodedThumb {
+    path: PathBuf,
+    image: egui::ColorImage,
+}
+
 pub struct TabManagerApp {
     bridge: PlatformBridge,
     config_dir: PathBuf,
@@ -117,6 +123,12 @@ pub struct TabManagerApp {
     inspector_extra: Option<InspectorExtra>,
     inspector_rx: Option<Receiver<InspectorExtra>>,
 
+    // Async image thumbnail cache
+    thumbs: HashMap<PathBuf, TextureHandle>,
+    thumbs_requested: HashSet<PathBuf>,
+    thumb_tx: Sender<DecodedThumb>,
+    thumb_rx: Receiver<DecodedThumb>,
+
     sidebar_open: bool,
     keyboard_was_open: bool,
 }
@@ -135,6 +147,7 @@ impl TabManagerApp {
 
         let pane0 = PaneState::new(0, Location::Special(SpecialView::Home), 1);
         let pane1 = PaneState::new(1, Location::Dir(primary_root.clone()), 2);
+        let (thumb_tx, thumb_rx) = mpsc::channel();
 
         let mut app = Self {
             bridge,
@@ -159,6 +172,10 @@ impl TabManagerApp {
             toast: None,
             inspector_extra: None,
             inspector_rx: None,
+            thumbs: HashMap::new(),
+            thumbs_requested: HashSet::new(),
+            thumb_tx,
+            thumb_rx,
             sidebar_open: true,
             keyboard_was_open: false,
         };
@@ -177,6 +194,32 @@ impl TabManagerApp {
             message: msg.into(),
             is_error,
             expires_at: Instant::now() + Duration::from_secs(4),
+        });
+    }
+
+    fn request_thumbnail(&mut self, entry: &FileEntry) {
+        if !entry.is_image() || entry.size > 20 * 1024 * 1024 {
+            return;
+        }
+        if self.thumbs.contains_key(&entry.path) || self.thumbs_requested.contains(&entry.path) {
+            return;
+        }
+        if self.thumbs_requested.len() > 200 {
+            return;
+        }
+        self.thumbs_requested.insert(entry.path.clone());
+        let path = entry.path.clone();
+        let tx = self.thumb_tx.clone();
+        std::thread::spawn(move || {
+            if let Ok(img) = image::open(&path) {
+                let thumb = img.thumbnail(112, 112).to_rgba8();
+                let size = [thumb.width() as usize, thumb.height() as usize];
+                let color_img = egui::ColorImage::from_rgba_unmultiplied(size, thumb.as_raw());
+                let _ = tx.send(DecodedThumb {
+                    path,
+                    image: color_img,
+                });
+            }
         });
     }
 
@@ -319,6 +362,17 @@ impl TabManagerApp {
         self.save_prefs();
     }
 
+    fn set_sort(&mut self, by: SortBy) {
+        if self.prefs.sort_by == by {
+            self.prefs.sort_order = self.prefs.sort_order.toggled();
+        } else {
+            self.prefs.sort_by = by;
+            self.prefs.sort_order = SortOrder::Ascending;
+        }
+        self.save_prefs();
+        self.refresh_all_panes();
+    }
+
     fn open_entry(&mut self, pane_idx: usize, entry: &FileEntry, ctx: &egui::Context) {
         if entry.is_dir {
             self.navigate(pane_idx, Location::Dir(entry.path.clone()));
@@ -361,7 +415,6 @@ impl TabManagerApp {
             }
             return;
         }
-        // Fallback: open with external Android / OS app
         if let Err(e) = self.bridge.open_file(&entry.path) {
             self.show_toast(e, true);
         }
@@ -424,7 +477,12 @@ impl TabManagerApp {
         });
     }
 
-    fn start_compress_zip(&mut self, sources: Vec<PathBuf>, dest_dir: PathBuf, archive_name: String) {
+    fn start_compress_zip(
+        &mut self,
+        sources: Vec<PathBuf>,
+        dest_dir: PathBuf,
+        archive_name: String,
+    ) {
         let mut clean = archive_name.trim().to_string();
         if clean.is_empty() {
             clean = "Archiv.zip".to_string();
@@ -433,7 +491,7 @@ impl TabManagerApp {
             clean.push_str(".zip");
         }
         let output_zip = fs_ops::resolve_unique_path(&dest_dir, &clean);
-        let handle = BgJobHandle::new(format!("Komprimiere in {}…", clean));
+        let handle = BgJobHandle::new(format!("Komprimiere in {clean}…"));
         let worker_handle = handle.clone();
         self.bg_job = Some(handle);
 
@@ -550,7 +608,25 @@ impl TabManagerApp {
     }
 
     fn poll_async(&mut self, ctx: &egui::Context) {
-        // Periodically re-check All Files Access permission when returning from Android Settings
+        // Upload any freshly decoded image thumbnails
+        let mut got_thumb = false;
+        while let Ok(decoded) = self.thumb_rx.try_recv() {
+            if self.thumbs.len() > 160 {
+                self.thumbs.clear();
+                self.thumbs_requested.clear();
+            }
+            let tex = ctx.load_texture(
+                format!("thumb_{}", decoded.path.display()),
+                decoded.image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.thumbs.insert(decoded.path, tex);
+            got_thumb = true;
+        }
+        if got_thumb {
+            ctx.request_repaint();
+        }
+
         if !self.has_storage_access && self.last_perm_check.elapsed() > Duration::from_millis(800) {
             self.last_perm_check = Instant::now();
             if self.bridge.has_all_files_access() {
@@ -560,7 +636,6 @@ impl TabManagerApp {
             }
         }
 
-        // Poll Android back gesture
         if self.bridge.take_back_pressed() {
             if self.dialog.is_some() {
                 self.dialog = None;
@@ -576,7 +651,6 @@ impl TabManagerApp {
             ctx.request_repaint();
         }
 
-        // Poll background file operation
         if let Some(job) = &self.bg_job {
             let snap = job.snapshot();
             if snap.done {
@@ -592,7 +666,6 @@ impl TabManagerApp {
             }
         }
 
-        // Poll async search / category scan
         if let Some(rx) = &self.search_rx {
             if let Ok(res) = rx.try_recv() {
                 self.panes[res.pane].entries = res.entries;
@@ -604,7 +677,6 @@ impl TabManagerApp {
             }
         }
 
-        // Poll inspector SHA-256 / folder stats
         if let Some(rx) = &self.inspector_rx {
             if let Ok(extra) = rx.try_recv() {
                 self.inspector_extra = Some(extra);
@@ -614,7 +686,6 @@ impl TabManagerApp {
             }
         }
 
-        // Clear expired toast
         if let Some(t) = &self.toast {
             if Instant::now() >= t.expires_at {
                 self.toast = None;
@@ -623,7 +694,6 @@ impl TabManagerApp {
             }
         }
 
-        // Sync Android soft keyboard with egui text focus
         let wants_kb = ctx.egui_wants_keyboard_input();
         if wants_kb && !self.keyboard_was_open {
             self.bridge.show_keyboard();
@@ -637,40 +707,64 @@ impl TabManagerApp {
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let p = apply_theme(&ctx, self.prefs.theme);
-        let screen_width = ctx.content_rect().width();
-        let is_wide_tablet = screen_width >= 900.0;
 
-        // Top Action Toolbar
-        egui::Panel::top("top_toolbar")
+        // Respect Android system status bar, navigation bar & cutout insets!
+        let ppp = ctx.pixels_per_point().max(1.0);
+        let (in_top_px, in_bot_px, in_left_px, in_right_px) = self.bridge.system_insets_px();
+        let top_pad = (in_top_px / ppp).round() as i8;
+        let bot_pad = (in_bot_px / ppp).round() as i8;
+        let left_pad = (in_left_px / ppp).round() as i8;
+        let right_pad = (in_right_px / ppp).round() as i8;
+
+        let screen_width = ctx.content_rect().width();
+        let is_wide_tablet = screen_width >= 880.0;
+        let dual = self.prefs.dual_pane && screen_width >= 760.0;
+
+        // 1. Clean Single-Row Top Header Bar (sits cleanly below Android status bar)
+        egui::Panel::top("top_header")
             .frame(
                 Frame::NONE
-                    .fill(p.bg_sidebar)
-                    .inner_margin(Margin::symmetric(14, 10))
-                    .stroke(Stroke::new(1.0, p.border)),
+                    .fill(p.bg_header)
+                    .inner_margin(Margin {
+                        left: 14 + left_pad,
+                        right: 14 + right_pad,
+                        top: 10 + top_pad,
+                        bottom: 10,
+                    })
+                    .stroke(Stroke::new(1.0, p.divider)),
             )
             .show(ui, |ui| {
-                self.draw_top_toolbar(ui, &p, is_wide_tablet);
+                self.draw_top_header(ui, &p, is_wide_tablet);
             });
 
-        // Permission banner on Android 11+ if All Files Access is not granted
+        // 2. Permission Banner (only shown if All Files Access is missing on Android 11+)
         if !self.has_storage_access {
             egui::Panel::top("perm_banner")
                 .frame(
                     Frame::NONE
                         .fill(p.accent_soft)
-                        .inner_margin(Margin::symmetric(16, 10)),
+                        .inner_margin(Margin::symmetric(18, 10)),
                 )
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        icon_widget(ui, Icon::Shield, 18.0, p.accent);
+                        ui.add_space(4.0);
                         ui.label(
-                            RichText::new("Speicherzugriff erforderlich — Bitte erlaube 'Zugriff auf alle Dateien' für vollständige Dateiverwaltung.")
-                                .color(Color32::WHITE)
-                                .strong(),
+                            RichText::new("Speicherzugriff erforderlich — Erlaube 'Zugriff auf alle Dateien', um alle Ordner und Dateien zu verwalten.")
+                                .size(13.5)
+                                .color(p.text_primary),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui
-                                .button(RichText::new("Berechtigung öffnen").strong())
-                                .clicked()
+                            if pill_button(
+                                ui,
+                                Icon::Shield,
+                                "Berechtigung öffnen",
+                                p.accent,
+                                p.accent_hover,
+                                Color32::WHITE,
+                                None,
+                            )
+                            .clicked()
                             {
                                 self.bridge.request_all_files_access();
                             }
@@ -679,13 +773,18 @@ impl TabManagerApp {
                 });
         }
 
-        // Persistent Clipboard Banner
+        // 3. Persistent Clipboard Bar (when files are copied/cut)
         if !self.clipboard.is_empty() {
             egui::Panel::bottom("clipboard_bar")
                 .frame(
                     Frame::NONE
-                        .fill(p.bg_panel)
-                        .inner_margin(Margin::symmetric(16, 10))
+                        .fill(p.bg_floating)
+                        .inner_margin(Margin {
+                            left: 18 + left_pad,
+                            right: 18 + right_pad,
+                            top: 10,
+                            bottom: 10 + bot_pad,
+                        })
                         .stroke(Stroke::new(1.0, p.accent)),
                 )
                 .show(ui, |ui| {
@@ -693,53 +792,67 @@ impl TabManagerApp {
                 });
         }
 
-        // Left Navigation Sidebar
+        // 4. Sleek Finder / One UI Sidebar
         if self.sidebar_open {
             egui::Panel::left("sidebar")
                 .resizable(true)
-                .default_size(240.0)
-                .size_range(200.0..=320.0)
+                .default_size(248.0)
+                .size_range(210.0..=310.0)
                 .frame(
                     Frame::NONE
                         .fill(p.bg_sidebar)
-                        .inner_margin(Margin::symmetric(12, 12))
-                        .stroke(Stroke::new(1.0, p.border)),
+                        .inner_margin(Margin {
+                            left: 12 + left_pad,
+                            right: 12,
+                            top: 14,
+                            bottom: 14 + bot_pad,
+                        })
+                        .stroke(Stroke::new(1.0, p.divider)),
                 )
                 .show(ui, |ui| {
                     self.draw_sidebar(ui, &p);
                 });
         }
 
-        // Optional Right Inspector Panel
+        // 5. Optional Right Inspector Panel
         if self.prefs.show_inspector && is_wide_tablet {
             egui::Panel::right("inspector")
                 .resizable(true)
                 .default_size(290.0)
-                .size_range(250.0..=380.0)
+                .size_range(250.0..=360.0)
                 .frame(
                     Frame::NONE
                         .fill(p.bg_sidebar)
-                        .inner_margin(Margin::symmetric(14, 12))
-                        .stroke(Stroke::new(1.0, p.border)),
+                        .inner_margin(Margin {
+                            left: 16,
+                            right: 16 + right_pad,
+                            top: 16,
+                            bottom: 16 + bot_pad,
+                        })
+                        .stroke(Stroke::new(1.0, p.divider)),
                 )
                 .show(ui, |ui| {
                     self.draw_inspector_panel(ui, &p);
                 });
         }
 
-        // Main Workspace (Single Pane or Dual Pane Split-View!)
+        // 6. Main File Workspace
         egui::CentralPanel::default()
             .frame(
                 Frame::NONE
                     .fill(p.bg_canvas)
-                    .inner_margin(Margin::same(10)),
+                    .inner_margin(Margin {
+                        left: 14,
+                        right: 14 + right_pad,
+                        top: 12,
+                        bottom: 12 + bot_pad,
+                    }),
             )
             .show(ui, |ui| {
-                let dual = self.prefs.dual_pane && screen_width >= 780.0;
                 if dual {
                     let avail = ui.available_size();
-                    let gap = 10.0;
-                    let half_w = ((avail.x - gap) / 2.0).max(200.0);
+                    let gap = 12.0;
+                    let half_w = ((avail.x - gap) * 0.5).max(200.0);
                     ui.horizontal(|ui| {
                         ui.allocate_ui(Vec2::new(half_w, avail.y), |ui| {
                             self.draw_pane(ui, &ctx, 0, &p, true);
@@ -754,42 +867,42 @@ impl TabManagerApp {
                 }
             });
 
-        // Modals, Viewers, Progress Overlay & Toasts
+        // 7. Floating Glass Selection Pill (bottom-center, like One UI / iPadOS Files)
+        let active_sel_count = self.panes[self.active_pane].selected.len();
+        if active_sel_count > 0 {
+            self.draw_floating_selection_bar(&ctx, self.active_pane, &p, dual, bot_pad as f32);
+        }
+
+        // 8. Modals, Viewers, Progress & Toasts
         self.draw_dialogs(&ctx, &p);
         self.draw_viewer(&ctx, &p);
         self.draw_progress_overlay(&ctx, &p);
-        self.draw_toast(&ctx, &p);
+        self.draw_toast(&ctx, &p, bot_pad as f32);
     }
 
-    fn draw_top_toolbar(&mut self, ui: &mut egui::Ui, p: &Palette, is_wide: bool) {
+    fn draw_top_header(&mut self, ui: &mut egui::Ui, p: &Palette, is_wide: bool) {
         let ap = self.active_pane;
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             // Sidebar toggle
-            if ui
-                .button(if self.sidebar_open { "◧" } else { "☰" })
-                .on_hover_text("Seitenleiste ein-/ausblenden")
-                .clicked()
+            if icon_button(
+                ui,
+                Icon::Sidebar,
+                self.sidebar_open,
+                true,
+                p.bg_hover,
+                p.accent_soft,
+                p.text_secondary,
+                p.accent,
+            )
+            .on_hover_text("Seitenleiste")
+            .clicked()
             {
                 self.sidebar_open = !self.sidebar_open;
             }
 
-            // Branding badge
-            ui.label(
-                RichText::new("TabManager")
-                    .size(18.0)
-                    .strong()
-                    .color(p.text_primary),
-            );
-            ui.label(
-                RichText::new("RUST")
-                    .size(10.0)
-                    .strong()
-                    .color(p.cyan),
-            );
+            ui.add_space(4.0);
 
-            ui.separator();
-
-            // Navigation buttons
+            // Navigation cluster
             let can_back = !self.panes[ap].current_tab().history_back.is_empty();
             let can_fwd = !self.panes[ap].current_tab().history_forward.is_empty();
             let can_up = self.panes[ap]
@@ -797,177 +910,158 @@ impl TabManagerApp {
                 .and_then(|d| d.parent())
                 .is_some();
 
-            if ui
-                .add_enabled(can_back, egui::Button::new("◀"))
-                .on_hover_text("Zurück")
-                .clicked()
+            if icon_button(
+                ui,
+                Icon::Back,
+                false,
+                can_back,
+                p.bg_hover,
+                p.accent_soft,
+                p.text_primary,
+                p.accent,
+            )
+            .clicked()
             {
                 self.go_back(ap);
             }
-            if ui
-                .add_enabled(can_fwd, egui::Button::new("▶"))
-                .on_hover_text("Vorwärts")
-                .clicked()
+            if icon_button(
+                ui,
+                Icon::Forward,
+                false,
+                can_fwd,
+                p.bg_hover,
+                p.accent_soft,
+                p.text_primary,
+                p.accent,
+            )
+            .clicked()
             {
                 self.go_forward(ap);
             }
-            if ui
-                .add_enabled(can_up, egui::Button::new("▲"))
-                .on_hover_text("Übergeordneter Ordner")
-                .clicked()
+            if icon_button(
+                ui,
+                Icon::Up,
+                false,
+                can_up,
+                p.bg_hover,
+                p.accent_soft,
+                p.text_primary,
+                p.accent,
+            )
+            .clicked()
             {
                 self.go_up(ap);
             }
-            if ui.button("↻").on_hover_text("Aktualisieren").clicked() {
+            if icon_button(
+                ui,
+                Icon::Refresh,
+                false,
+                true,
+                p.bg_hover,
+                p.accent_soft,
+                p.text_secondary,
+                p.accent,
+            )
+            .clicked()
+            {
                 self.refresh_all_panes();
             }
 
-            ui.separator();
+            ui.add_space(8.0);
 
-            // Search Box
-            let search_w = if is_wide { 240.0 } else { 150.0 };
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.search_query)
-                    .hint_text("Suchen…")
-                    .desired_width(search_w),
-            );
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                self.start_recursive_search(ap);
-            }
-            if !self.search_query.is_empty() {
-                if ui
-                    .button("Tiefensuche")
-                    .on_hover_text("Alle Unterordner durchsuchen")
-                    .clicked()
-                {
-                    self.start_recursive_search(ap);
-                }
-                if ui.button("✕").clicked() {
-                    self.search_query.clear();
-                    if self.search_recursive_mode {
-                        self.search_recursive_mode = false;
-                        self.refresh_pane(ap);
-                    }
-                }
-            }
-
-            // Right-aligned controls
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                // Theme toggle
-                let theme_lbl = match self.prefs.theme {
-                    ThemeMode::Dark => "☀ Hell",
-                    ThemeMode::Light => "☾ AMOLED",
-                };
-                if ui.button(theme_lbl).clicked() {
-                    self.prefs.theme = match self.prefs.theme {
-                        ThemeMode::Dark => ThemeMode::Light,
-                        ThemeMode::Light => ThemeMode::Dark,
-                    };
-                    self.save_prefs();
-                }
-
-                // Inspector toggle
-                if is_wide {
-                    let insp_btn = egui::Button::new("ℹ Details").fill(if self.prefs.show_inspector {
-                        p.accent
-                    } else {
-                        p.bg_card
-                    });
-                    if ui.add(insp_btn).clicked() {
-                        self.prefs.show_inspector = !self.prefs.show_inspector;
-                        self.save_prefs();
-                    }
-                }
-
-                // Dual-Pane Split-View toggle
-                let dual_btn = egui::Button::new("◫ Dual-Pane").fill(if self.prefs.dual_pane {
-                    p.accent
-                } else {
-                    p.bg_card
-                });
-                if ui
-                    .add(dual_btn)
-                    .on_hover_text("Zwei Dateifenster nebeneinander")
-                    .clicked()
-                {
-                    self.prefs.dual_pane = !self.prefs.dual_pane;
-                    if !self.prefs.dual_pane {
-                        self.active_pane = 0;
-                    }
-                    self.save_prefs();
-                }
-
-                // View Mode toggle
-                let view_lbl = match self.prefs.view_mode {
-                    ViewMode::List => "▦ Raster",
-                    ViewMode::Grid => "☰ Liste",
-                };
-                if ui.button(view_lbl).clicked() {
-                    self.prefs.view_mode = match self.prefs.view_mode {
-                        ViewMode::List => ViewMode::Grid,
-                        ViewMode::Grid => ViewMode::List,
-                    };
-                    self.save_prefs();
-                }
-
-                // Sort & Filter menu
-                ui.menu_button("⇅ Sortieren", |ui| {
-                    for opt in [SortBy::Name, SortBy::Date, SortBy::Size, SortBy::Type] {
-                        let selected = self.prefs.sort_by == opt;
-                        let arrow = if selected {
-                            match self.prefs.sort_order {
-                                SortOrder::Ascending => " ↑",
-                                SortOrder::Descending => " ↓",
-                            }
-                        } else {
-                            ""
-                        };
-                        if ui
-                            .selectable_label(selected, format!("{}{}", opt.label(), arrow))
-                            .clicked()
-                        {
-                            if self.prefs.sort_by == opt {
-                                self.prefs.sort_order = self.prefs.sort_order.toggled();
-                            } else {
-                                self.prefs.sort_by = opt;
-                                self.prefs.sort_order = SortOrder::Ascending;
-                            }
-                            self.save_prefs();
-                            self.refresh_all_panes();
-                            ui.close();
+            // Modern rounded search pill
+            let search_w = if is_wide { 260.0 } else { 150.0 };
+            Frame::NONE
+                .fill(p.bg_surface)
+                .corner_radius(CornerRadius::same(12))
+                .stroke(Stroke::new(1.0, p.divider))
+                .inner_margin(Margin::symmetric(10, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        icon_widget(ui, Icon::Search, 16.0, p.text_muted);
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.search_query)
+                                .hint_text("Dateien suchen…")
+                                .frame(Frame::NONE)
+                                .desired_width(search_w),
+                        );
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            self.start_recursive_search(ap);
                         }
-                    }
-                    ui.separator();
-                    if ui
-                        .checkbox(&mut self.prefs.folders_first, "Ordner zuerst")
-                        .changed()
-                    {
-                        self.save_prefs();
-                        self.refresh_all_panes();
-                    }
-                    if ui
-                        .checkbox(&mut self.prefs.show_hidden, "Versteckte Dateien (.dot)")
-                        .changed()
-                    {
-                        self.save_prefs();
-                        self.refresh_all_panes();
-                    }
+                        if !self.search_query.is_empty() {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Tief").size(11.5).color(p.cyan),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text("In allen Unterordnern suchen")
+                                .clicked()
+                            {
+                                self.start_recursive_search(ap);
+                            }
+                            if icon_button(
+                                ui,
+                                Icon::Close,
+                                false,
+                                true,
+                                p.bg_hover,
+                                p.accent_soft,
+                                p.text_muted,
+                                p.text_primary,
+                            )
+                            .clicked()
+                            {
+                                self.search_query.clear();
+                                if self.search_recursive_mode {
+                                    self.search_recursive_mode = false;
+                                    self.refresh_pane(ap);
+                                }
+                            }
+                        }
+                    });
                 });
 
-                // "+ Neu" menu (New Folder / New File)
+            // Right-aligned toolbar controls
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // Primary "+ Neu" CTA pill
                 let in_dir = self.panes[ap].current_dir().is_some();
                 ui.add_enabled_ui(in_dir, |ui| {
                     ui.menu_button(
-                        RichText::new("+ Neu").strong().color(p.cyan),
+                        RichText::new("  + Neu  ")
+                            .size(13.5)
+                            .strong()
+                            .color(Color32::WHITE),
                         |ui| {
-                            if ui.button("📁 Neuer Ordner").clicked() {
+                            if pill_button(
+                                ui,
+                                Icon::Folder,
+                                "Neuer Ordner",
+                                Color32::TRANSPARENT,
+                                p.bg_hover,
+                                p.text_primary,
+                                Some(170.0),
+                            )
+                            .clicked()
+                            {
                                 self.dialog = Some(DialogState::NewFolder {
                                     pane: ap,
                                     name: String::new(),
                                 });
                                 ui.close();
                             }
-                            if ui.button("📄 Neue Textdatei").clicked() {
+                            if pill_button(
+                                ui,
+                                Icon::File,
+                                "Neue Textdatei",
+                                Color32::TRANSPARENT,
+                                p.bg_hover,
+                                p.text_primary,
+                                Some(170.0),
+                            )
+                            .clicked()
+                            {
                                 self.dialog = Some(DialogState::NewFile {
                                     pane: ap,
                                     name: "neu.txt".to_string(),
@@ -977,6 +1071,137 @@ impl TabManagerApp {
                         },
                     );
                 });
+
+                // Theme toggle
+                let theme_icon = match self.prefs.theme {
+                    ThemeMode::Dark => Icon::Sun,
+                    ThemeMode::Light => Icon::Moon,
+                };
+                if icon_button(
+                    ui,
+                    theme_icon,
+                    false,
+                    true,
+                    p.bg_hover,
+                    p.accent_soft,
+                    p.text_secondary,
+                    p.accent,
+                )
+                .on_hover_text("Design wechseln (AMOLED / Hell)")
+                .clicked()
+                {
+                    self.prefs.theme = match self.prefs.theme {
+                        ThemeMode::Dark => ThemeMode::Light,
+                        ThemeMode::Light => ThemeMode::Dark,
+                    };
+                    self.save_prefs();
+                }
+
+                // Inspector toggle
+                if is_wide {
+                    if icon_button(
+                        ui,
+                        Icon::Info,
+                        self.prefs.show_inspector,
+                        true,
+                        p.bg_hover,
+                        p.accent_soft,
+                        p.text_secondary,
+                        p.accent,
+                    )
+                    .on_hover_text("Inspektor / Details")
+                    .clicked()
+                    {
+                        self.prefs.show_inspector = !self.prefs.show_inspector;
+                        self.save_prefs();
+                    }
+                }
+
+                // Dual-Pane toggle
+                if icon_button(
+                    ui,
+                    Icon::DualPane,
+                    self.prefs.dual_pane,
+                    true,
+                    p.bg_hover,
+                    p.accent_soft,
+                    p.text_secondary,
+                    p.accent,
+                )
+                .on_hover_text("Dual-Pane Split-Ansicht")
+                .clicked()
+                {
+                    self.prefs.dual_pane = !self.prefs.dual_pane;
+                    if !self.prefs.dual_pane {
+                        self.active_pane = 0;
+                    }
+                    self.save_prefs();
+                }
+
+                // List / Grid toggle
+                let view_icon = match self.prefs.view_mode {
+                    ViewMode::List => Icon::Grid,
+                    ViewMode::Grid => Icon::List,
+                };
+                if icon_button(
+                    ui,
+                    view_icon,
+                    false,
+                    true,
+                    p.bg_hover,
+                    p.accent_soft,
+                    p.text_secondary,
+                    p.accent,
+                )
+                .on_hover_text("Liste / Raster wechseln")
+                .clicked()
+                {
+                    self.prefs.view_mode = match self.prefs.view_mode {
+                        ViewMode::List => ViewMode::Grid,
+                        ViewMode::Grid => ViewMode::List,
+                    };
+                    self.save_prefs();
+                }
+
+                // Sort & View options menu
+                ui.menu_button(
+                    RichText::new("Sortieren").size(13.0).color(p.text_secondary),
+                    |ui| {
+                        for opt in [SortBy::Name, SortBy::Date, SortBy::Size, SortBy::Type] {
+                            let selected = self.prefs.sort_by == opt;
+                            let suffix = if selected {
+                                match self.prefs.sort_order {
+                                    SortOrder::Ascending => " (Aufst.)",
+                                    SortOrder::Descending => " (Abst.)",
+                                }
+                            } else {
+                                ""
+                            };
+                            if ui
+                                .selectable_label(selected, format!("{}{}", opt.label(), suffix))
+                                .clicked()
+                            {
+                                self.set_sort(opt);
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        if ui
+                            .checkbox(&mut self.prefs.folders_first, "Ordner zuerst")
+                            .changed()
+                        {
+                            self.save_prefs();
+                            self.refresh_all_panes();
+                        }
+                        if ui
+                            .checkbox(&mut self.prefs.show_hidden, "Versteckte Dateien (.dot)")
+                            .changed()
+                        {
+                            self.save_prefs();
+                            self.refresh_all_panes();
+                        }
+                    },
+                );
             });
         });
     }
@@ -984,97 +1209,180 @@ impl TabManagerApp {
     fn draw_sidebar(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let ap = self.active_pane;
         ScrollArea::vertical().show(ui, |ui| {
-            // Quick Navigation
-            self.sidebar_section_title(ui, "SCHNELLZUGRIFF", p);
+            // App Branding Header
+            ui.horizontal(|ui| {
+                category_icon_badge(ui, FileCategory::Folder, 34.0, p.accent);
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("TabManager")
+                            .size(16.5)
+                            .strong()
+                            .color(p.text_primary),
+                    );
+                    ui.label(
+                        RichText::new("Rust Native • 120 Hz")
+                            .size(11.0)
+                            .color(p.text_muted),
+                    );
+                });
+            });
 
-            if self.sidebar_item(
+            ui.add_space(16.0);
+            self.sidebar_section(ui, "SCHNELLZUGRIFF", p);
+
+            if self.sidebar_nav_item(
                 ui,
-                "🏠  Übersicht",
+                Icon::Home,
+                "Übersicht",
                 matches!(
                     self.panes[ap].current_location(),
                     Location::Special(SpecialView::Home)
                 ),
+                p.accent,
                 p,
             ) {
                 self.navigate(ap, Location::Special(SpecialView::Home));
             }
 
-            let downloads = self.primary_root.join("Download");
-            let downloads_alt = self.primary_root.join("Downloads");
-            let dl_path = if downloads.exists() {
-                downloads
-            } else {
-                downloads_alt
-            };
-            if self.sidebar_item(
+            let root = self.primary_root.clone();
+            if self.sidebar_nav_item(
                 ui,
-                "⬇  Downloads",
-                self.panes[ap].current_dir() == Some(dl_path.as_path()),
+                Icon::Storage,
+                "Interner Speicher",
+                self.panes[ap].current_dir() == Some(root.as_path()),
+                p.cyan,
                 p,
             ) {
-                self.navigate(ap, Location::Dir(dl_path));
+                self.navigate(ap, Location::Dir(root));
+            }
+
+            let dl = {
+                let d1 = self.primary_root.join("Download");
+                if d1.exists() {
+                    d1
+                } else {
+                    self.primary_root.join("Downloads")
+                }
+            };
+            if self.sidebar_nav_item(
+                ui,
+                Icon::Download,
+                "Downloads",
+                self.panes[ap].current_dir() == Some(dl.as_path()),
+                Color32::from_rgb(59, 130, 246),
+                p,
+            ) {
+                self.navigate(ap, Location::Dir(dl));
             }
 
             let docs = self.primary_root.join("Documents");
-            if self.sidebar_item(
+            if self.sidebar_nav_item(
                 ui,
-                "📄  Dokumente",
+                Icon::Document,
+                "Dokumente",
                 self.panes[ap].current_dir() == Some(docs.as_path()),
+                Color32::from_rgb(99, 102, 241),
                 p,
             ) {
                 self.navigate(ap, Location::Dir(docs));
             }
 
             let dcim = self.primary_root.join("DCIM");
-            if self.sidebar_item(
+            if self.sidebar_nav_item(
                 ui,
-                "📷  Kamera (DCIM)",
+                Icon::Image,
+                "Kamera (DCIM)",
                 self.panes[ap].current_dir() == Some(dcim.as_path()),
+                Color32::from_rgb(56, 189, 248),
                 p,
             ) {
                 self.navigate(ap, Location::Dir(dcim));
             }
 
-            ui.add_space(10.0);
-            self.sidebar_section_title(ui, "KATEGORIEN", p);
-            for (icon, cat) in [
-                ("🖼", FileCategory::Image),
-                ("🎬", FileCategory::Video),
-                ("🎵", FileCategory::Audio),
-                ("📑", FileCategory::Document),
-                ("📦", FileCategory::Archive),
-                ("🤖", FileCategory::Apk),
+            ui.add_space(14.0);
+            self.sidebar_section(ui, "KATEGORIEN", p);
+            for cat in [
+                FileCategory::Image,
+                FileCategory::Video,
+                FileCategory::Audio,
+                FileCategory::Document,
+                FileCategory::Archive,
+                FileCategory::Apk,
             ] {
                 let active = matches!(
                     self.panes[ap].current_location(),
                     Location::Special(SpecialView::Category(c)) if *c == cat
                 );
-                if self.sidebar_item(ui, &format!("{icon}  {}", cat.label()), active, p) {
+                if self.sidebar_nav_item(
+                    ui,
+                    Icon::for_category(cat),
+                    cat.label(),
+                    active,
+                    Palette::category_color(cat),
+                    p,
+                ) {
                     self.navigate(ap, Location::Special(SpecialView::Category(cat)));
                 }
             }
 
-            ui.add_space(10.0);
-            self.sidebar_section_title(ui, "SPEICHER", p);
+            if !self.prefs.favorites.is_empty() {
+                ui.add_space(14.0);
+                self.sidebar_section(ui, "FAVORITEN", p);
+                let favs = self.prefs.favorites.clone();
+                for fav in favs {
+                    let name = fav
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| fav.to_string_lossy().into_owned());
+                    let active = self.panes[ap].current_dir() == Some(fav.as_path());
+                    if self.sidebar_nav_item(
+                        ui,
+                        Icon::StarFilled,
+                        &name,
+                        active,
+                        p.warning,
+                        p,
+                    ) {
+                        self.navigate(ap, Location::Dir(fav));
+                    }
+                }
+            }
+
+            ui.add_space(14.0);
+            self.sidebar_section(ui, "SPEICHER", p);
             let volumes = self.storage_volumes.clone();
             for vol in &volumes {
                 let is_cur = self.panes[ap].current_dir() == Some(vol.path.as_path());
-                let card = Frame::NONE
-                    .fill(if is_cur { p.bg_selected } else { p.bg_card })
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(Margin::same(10))
-                    .stroke(Stroke::new(1.0, if is_cur { p.accent } else { p.border }));
-
-                let resp = card
+                let resp = Frame::NONE
+                    .fill(if is_cur { p.bg_selected } else { p.bg_surface })
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(Margin::same(12))
+                    .stroke(Stroke::new(
+                        1.0,
+                        if is_cur { p.accent } else { p.divider },
+                    ))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        let icon = if vol.is_removable { "💾" } else { "📱" };
-                        ui.label(
-                            RichText::new(format!("{icon} {}", vol.name))
-                                .strong()
-                                .color(p.text_primary),
-                        );
-                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            icon_widget(
+                                ui,
+                                if vol.is_removable {
+                                    Icon::SdCard
+                                } else {
+                                    Icon::Storage
+                                },
+                                18.0,
+                                p.cyan,
+                            );
+                            ui.label(
+                                RichText::new(&vol.name)
+                                    .size(13.5)
+                                    .strong()
+                                    .color(p.text_primary),
+                            );
+                        });
+                        ui.add_space(8.0);
                         let frac = vol.used_fraction();
                         let bar_color = if frac > 0.9 {
                             p.danger
@@ -1083,19 +1391,15 @@ impl TabManagerApp {
                         } else {
                             p.accent
                         };
-                        ui.add(
-                            egui::ProgressBar::new(frac)
-                                .desired_height(6.0)
-                                .fill(bar_color),
-                        );
-                        ui.add_space(2.0);
+                        self.draw_slim_bar(ui, frac, bar_color, p.bg_hover, 6.0);
+                        ui.add_space(5.0);
                         ui.label(
                             RichText::new(format!(
-                                "{} / {} frei",
+                                "{} frei von {}",
                                 format_size(vol.free_bytes),
                                 format_size(vol.total_bytes)
                             ))
-                            .size(11.0)
+                            .size(11.5)
                             .color(p.text_secondary),
                         );
                     })
@@ -1107,55 +1411,107 @@ impl TabManagerApp {
                 ui.add_space(6.0);
             }
 
-            // Favorites
-            if !self.prefs.favorites.is_empty() {
-                ui.add_space(6.0);
-                self.sidebar_section_title(ui, "FAVORITEN", p);
-                let favs = self.prefs.favorites.clone();
-                for fav in favs {
-                    let name = fav
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| fav.to_string_lossy().into_owned());
-                    let is_cur = self.panes[ap].current_dir() == Some(fav.as_path());
-                    if self.sidebar_item(ui, &format!("★  {name}"), is_cur, p) {
-                        self.navigate(ap, Location::Dir(fav));
-                    }
-                }
-            }
-
             ui.add_space(10.0);
-            self.sidebar_section_title(ui, "SYSTEM", p);
             let trash_active = matches!(
                 self.panes[ap].current_location(),
                 Location::Special(SpecialView::Trash)
             );
-            if self.sidebar_item(ui, "🗑  Papierkorb", trash_active, p) {
+            if self.sidebar_nav_item(ui, Icon::Trash, "Papierkorb", trash_active, p.danger, p) {
                 self.navigate(ap, Location::Special(SpecialView::Trash));
             }
         });
     }
 
-    fn sidebar_section_title(&self, ui: &mut egui::Ui, title: &str, p: &Palette) {
+    fn sidebar_section(&self, ui: &mut egui::Ui, label: &str, p: &Palette) {
         ui.label(
-            RichText::new(title)
-                .size(11.0)
+            RichText::new(label)
+                .size(10.5)
                 .strong()
                 .color(p.text_muted),
         );
         ui.add_space(4.0);
     }
 
-    fn sidebar_item(&self, ui: &mut egui::Ui, label: &str, active: bool, p: &Palette) -> bool {
-        let btn = egui::Button::new(
-            RichText::new(label)
-                .size(14.0)
-                .color(if active { Color32::WHITE } else { p.text_primary }),
-        )
-        .fill(if active { p.accent } else { Color32::TRANSPARENT })
-        .stroke(Stroke::NONE)
-        .min_size(Vec2::new(ui.available_width(), 36.0));
-        ui.add(btn).clicked()
+    fn sidebar_nav_item(
+        &self,
+        ui: &mut egui::Ui,
+        icon: Icon,
+        label: &str,
+        active: bool,
+        icon_tint: Color32,
+        p: &Palette,
+    ) -> bool {
+        let w = ui.available_width();
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, 38.0), Sense::click());
+        let bg = if active {
+            p.accent_soft
+        } else if resp.hovered() {
+            p.bg_hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        if bg != Color32::TRANSPARENT {
+            ui.painter().rect_filled(rect, CornerRadius::same(10), bg);
+        }
+        if active {
+            let indicator = Rect::from_min_size(
+                egui::pos2(rect.left() + 2.0, rect.top() + 8.0),
+                vec2(3.5, rect.height() - 16.0),
+            );
+            ui.painter()
+                .rect_filled(indicator, CornerRadius::same(2), p.accent);
+        }
+
+        let ic_rect = Rect::from_center_size(
+            egui::pos2(rect.left() + 22.0, rect.center().y),
+            vec2(18.0, 18.0),
+        );
+        paint_icon(
+            ui.painter(),
+            ic_rect,
+            icon,
+            if active { p.accent } else { icon_tint },
+        );
+
+        let text_color = if active {
+            p.text_primary
+        } else {
+            p.text_secondary
+        };
+        let galley = ui.painter().layout_no_wrap(
+            label.to_string(),
+            egui::FontId::proportional(14.0),
+            text_color,
+        );
+        ui.painter().galley(
+            egui::pos2(rect.left() + 40.0, rect.center().y - galley.size().y * 0.5),
+            galley,
+            text_color,
+        );
+        resp.clicked()
+    }
+
+    fn draw_slim_bar(
+        &self,
+        ui: &mut egui::Ui,
+        fraction: f32,
+        fill: Color32,
+        track: Color32,
+        height: f32,
+    ) {
+        let w = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(vec2(w, height), Sense::hover());
+        let cr = CornerRadius::same((height * 0.5) as u8);
+        ui.painter().rect_filled(rect, cr, track);
+        let filled_w = (rect.width() * fraction.clamp(0.0, 1.0)).max(if fraction > 0.0 {
+            height
+        } else {
+            0.0
+        });
+        if filled_w > 0.0 {
+            let filled = Rect::from_min_size(rect.min, vec2(filled_w, rect.height()));
+            ui.painter().rect_filled(filled, cr, fill);
+        }
     }
 
     fn draw_pane(
@@ -1167,42 +1523,38 @@ impl TabManagerApp {
         is_dual: bool,
     ) {
         let is_active = self.active_pane == pane_idx;
-        let border_color = if is_dual && is_active {
-            p.accent
+        let stroke = if is_dual && is_active {
+            Stroke::new(1.5, p.accent)
         } else {
-            p.border
+            Stroke::new(1.0, p.divider)
         };
 
         Frame::NONE
-            .fill(p.bg_panel)
-            .corner_radius(CornerRadius::same(14))
-            .stroke(Stroke::new(if is_dual && is_active { 1.5 } else { 1.0 }, border_color))
-            .inner_margin(Margin::same(10))
+            .fill(p.bg_surface_alt)
+            .corner_radius(CornerRadius::same(16))
+            .stroke(stroke)
+            .inner_margin(Margin::same(14))
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
 
-                // 1. Multi-Tab Strip
-                self.draw_tab_strip(ui, pane_idx, p);
-                ui.add_space(6.0);
-
-                // 2. Breadcrumb Bar
-                self.draw_breadcrumb_bar(ui, pane_idx, p);
-                ui.add_space(6.0);
-
-                // 3. Selection / Context Action Bar (if items selected)
-                if !self.panes[pane_idx].selected.is_empty() {
-                    self.draw_selection_bar(ui, pane_idx, p, is_dual);
-                    ui.add_space(6.0);
+                // 1. Tab Strip (only prominent when >1 tab, plus subtle + tab button in breadcrumb)
+                if self.panes[pane_idx].tabs.len() > 1 {
+                    self.draw_tab_strip(ui, pane_idx, p);
+                    ui.add_space(8.0);
                 }
 
-                // 4. Content Area
+                // 2. Clean Breadcrumb Header
+                self.draw_breadcrumb_bar(ui, pane_idx, p);
+                ui.add_space(10.0);
+
+                // 3. Content
                 let loc = self.panes[pane_idx].current_location().clone();
                 match loc {
                     Location::Special(SpecialView::Home) => {
                         self.draw_home_dashboard(ui, pane_idx, p);
                     }
                     Location::Special(SpecialView::Trash) => {
-                        self.draw_trash_view(ui, pane_idx, p);
+                        self.draw_trash_view(ui, p);
                     }
                     Location::Dir(_) | Location::Special(SpecialView::Category(_)) => {
                         self.draw_file_browser(ui, ctx, pane_idx, p);
@@ -1223,51 +1575,61 @@ impl TabManagerApp {
             for i in 0..tab_count {
                 let title = self.panes[pane_idx].tabs[i].location.title();
                 let selected = i == active_idx;
-                let frame = Frame::NONE
-                    .fill(if selected { p.bg_card_hover } else { p.bg_card })
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin::symmetric(10, 5))
-                    .stroke(Stroke::new(
-                        1.0,
-                        if selected { p.accent } else { p.border },
-                    ));
-
-                frame.show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let lbl = ui.add(
-                            egui::Label::new(
-                                RichText::new(&title)
-                                    .size(13.0)
-                                    .color(if selected {
-                                        p.text_primary
-                                    } else {
-                                        p.text_secondary
-                                    }),
-                            )
-                            .sense(Sense::click()),
-                        );
-                        if lbl.clicked() {
-                            switch_to = Some(i);
-                        }
-                        if tab_count > 1 {
-                            if ui
-                                .add(
-                                    egui::Button::new(RichText::new("×").size(13.0))
-                                        .frame(false),
+                Frame::NONE
+                    .fill(if selected { p.bg_surface } else { Color32::TRANSPARENT })
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::symmetric(12, 6))
+                    .stroke(if selected {
+                        Stroke::new(1.0, p.divider)
+                    } else {
+                        Stroke::NONE
+                    })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let lbl = ui.add(
+                                egui::Label::new(
+                                    RichText::new(&title)
+                                        .size(13.0)
+                                        .strong()
+                                        .color(if selected {
+                                            p.text_primary
+                                        } else {
+                                            p.text_muted
+                                        }),
                                 )
-                                .clicked()
-                            {
-                                close_idx = Some(i);
+                                .sense(Sense::click()),
+                            );
+                            if lbl.clicked() {
+                                switch_to = Some(i);
                             }
-                        }
+                            if tab_count > 1 {
+                                let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+                                paint_icon(
+                                    ui.painter(),
+                                    Rect::from_center_size(r.center(), vec2(12.0, 12.0)),
+                                    Icon::Close,
+                                    if resp.hovered() { p.text_primary } else { p.text_muted },
+                                );
+                                if resp.clicked() {
+                                    close_idx = Some(i);
+                                }
+                            }
+                        });
                     });
-                });
             }
 
-            if ui
-                .button("+")
-                .on_hover_text("Neuen Tab öffnen")
-                .clicked()
+            if icon_button(
+                ui,
+                Icon::Plus,
+                false,
+                true,
+                p.bg_hover,
+                p.accent_soft,
+                p.text_secondary,
+                p.accent,
+            )
+            .on_hover_text("Neuen Tab öffnen")
+            .clicked()
             {
                 add_new = true;
             }
@@ -1291,85 +1653,108 @@ impl TabManagerApp {
         let loc = self.panes[pane_idx].current_location().clone();
         let mut nav_target: Option<Location> = None;
         let mut toggle_fav: Option<PathBuf> = None;
+        let mut add_tab = false;
 
-        Frame::NONE
-            .fill(p.bg_card)
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::symmetric(10, 6))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    match &loc {
-                        Location::Special(sp) => {
-                            ui.label(
-                                RichText::new(sp.title())
-                                    .strong()
-                                    .color(p.text_primary),
-                            );
-                        }
-                        Location::Dir(dir) => {
-                            let is_fav = self.prefs.favorites.contains(dir);
-                            if ui
-                                .button(if is_fav { "★" } else { "☆" })
-                                .on_hover_text("Als Favorit anheften")
-                                .clicked()
-                            {
-                                toggle_fav = Some(dir.clone());
-                            }
-
-                            let mut accum = PathBuf::new();
-                            let components: Vec<_> = dir.components().collect();
-                            for (i, comp) in components.iter().enumerate() {
-                                accum.push(comp);
-                                let seg_path = accum.clone();
-                                let label = if seg_path == Path::new("/storage/emulated/0") {
-                                    "Interner Speicher".to_string()
-                                } else {
-                                    comp.as_os_str().to_string_lossy().into_owned()
-                                };
-                                // Skip verbose /storage/emulated prefix on Android
-                                if seg_path == Path::new("/")
-                                    || seg_path == Path::new("/storage")
-                                    || seg_path == Path::new("/storage/emulated")
-                                {
-                                    if dir.starts_with("/storage/emulated/0") {
-                                        continue;
-                                    }
-                                }
-                                if i > 0 && seg_path != Path::new("/storage/emulated/0") {
-                                    ui.label(RichText::new("›").color(p.text_muted));
-                                }
-                                let is_last = i == components.len() - 1;
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new(label).color(if is_last {
-                                                p.text_primary
-                                            } else {
-                                                p.text_secondary
-                                            }),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    nav_target = Some(Location::Dir(seg_path));
-                                }
-                            }
-                        }
+        ui.horizontal(|ui| {
+            match &loc {
+                Location::Special(sp) => {
+                    ui.label(
+                        RichText::new(sp.title())
+                            .size(18.0)
+                            .strong()
+                            .color(p.text_primary),
+                    );
+                }
+                Location::Dir(dir) => {
+                    let is_fav = self.prefs.favorites.contains(dir);
+                    if icon_button(
+                        ui,
+                        if is_fav { Icon::StarFilled } else { Icon::Star },
+                        is_fav,
+                        true,
+                        p.bg_hover,
+                        Color32::TRANSPARENT,
+                        p.text_muted,
+                        p.warning,
+                    )
+                    .on_hover_text("Als Favorit anheften")
+                    .clicked()
+                    {
+                        toggle_fav = Some(dir.clone());
                     }
 
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let count = self.panes[pane_idx].entries.len();
-                        if matches!(loc, Location::Dir(_) | Location::Special(SpecialView::Category(_))) {
-                            ui.label(
-                                RichText::new(format!("{count} Elemente"))
-                                    .size(12.0)
-                                    .color(p.text_muted),
-                            );
+                    let mut accum = PathBuf::new();
+                    let components: Vec<_> = dir.components().collect();
+                    for (i, comp) in components.iter().enumerate() {
+                        accum.push(comp);
+                        let seg_path = accum.clone();
+                        if (seg_path == Path::new("/")
+                            || seg_path == Path::new("/storage")
+                            || seg_path == Path::new("/storage/emulated"))
+                            && dir.starts_with("/storage/emulated/0")
+                        {
+                            continue;
                         }
-                    });
-                });
+                        let label = if seg_path == Path::new("/storage/emulated/0") {
+                            "Interner Speicher".to_string()
+                        } else {
+                            comp.as_os_str().to_string_lossy().into_owned()
+                        };
+                        if i > 0 && seg_path != Path::new("/storage/emulated/0") {
+                            ui.label(RichText::new("/").size(14.0).color(p.text_muted));
+                        }
+                        let is_last = i == components.len() - 1;
+                        let resp = ui.add(
+                            egui::Label::new(
+                                RichText::new(label)
+                                    .size(if is_last { 16.0 } else { 14.5 })
+                                    .strong()
+                                    .color(if is_last {
+                                        p.text_primary
+                                    } else {
+                                        p.text_secondary
+                                    }),
+                            )
+                            .sense(Sense::click()),
+                        );
+                        if resp.clicked() {
+                            nav_target = Some(Location::Dir(seg_path));
+                        }
+                    }
+                }
+            }
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.panes[pane_idx].tabs.len() == 1 {
+                    if icon_button(
+                        ui,
+                        Icon::Plus,
+                        false,
+                        true,
+                        p.bg_hover,
+                        p.accent_soft,
+                        p.text_muted,
+                        p.accent,
+                    )
+                    .on_hover_text("Neuen Tab öffnen")
+                    .clicked()
+                    {
+                        add_tab = true;
+                    }
+                }
+                if matches!(
+                    loc,
+                    Location::Dir(_) | Location::Special(SpecialView::Category(_))
+                ) {
+                    let count = self.panes[pane_idx].entries.len();
+                    ui.label(
+                        RichText::new(format!("{count} Elemente"))
+                            .size(12.5)
+                            .color(p.text_muted),
+                    );
+                }
             });
+        });
 
         if let Some(target) = nav_target {
             self.navigate(pane_idx, target);
@@ -1377,241 +1762,74 @@ impl TabManagerApp {
         if let Some(fav_path) = toggle_fav {
             self.toggle_favorite(fav_path);
         }
-    }
-
-    fn draw_selection_bar(
-        &mut self,
-        ui: &mut egui::Ui,
-        pane_idx: usize,
-        p: &Palette,
-        is_dual: bool,
-    ) {
-        let selected_entries = self.panes[pane_idx].selected_entries();
-        let selected_paths: Vec<PathBuf> = selected_entries.iter().map(|e| e.path.clone()).collect();
-        let count = selected_paths.len();
-        let other_pane = 1 - pane_idx;
-        let other_dir = self.panes[other_pane].current_dir().map(Path::to_path_buf);
-
-        Frame::NONE
-            .fill(p.accent_soft)
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::symmetric(10, 7))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(format!("{count} ausgewählt"))
-                            .strong()
-                            .color(Color32::WHITE),
-                    );
-
-                    if ui.button("Alle").clicked() {
-                        let all: Vec<PathBuf> =
-                            self.panes[pane_idx].entries.iter().map(|e| e.path.clone()).collect();
-                        self.panes[pane_idx].selected.extend(all);
-                    }
-                    if ui.button("Abwählen").clicked() {
-                        self.panes[pane_idx].selected.clear();
-                    }
-
-                    ui.separator();
-
-                    if ui.button("📋 Kopieren").clicked() {
-                        self.clipboard = ClipboardState {
-                            paths: selected_paths.clone(),
-                            action: Some(ClipboardAction::Copy),
-                        };
-                        self.panes[pane_idx].selected.clear();
-                        self.show_toast(format!("{count} Element(e) zum Kopieren gemerkt"), false);
-                    }
-                    if ui.button("✂ Ausschneiden").clicked() {
-                        self.clipboard = ClipboardState {
-                            paths: selected_paths.clone(),
-                            action: Some(ClipboardAction::Move),
-                        };
-                        self.panes[pane_idx].selected.clear();
-                        self.show_toast(format!("{count} Element(e) zum Verschieben gemerkt"), false);
-                    }
-
-                    // Dual-Pane direct transfer buttons!
-                    if is_dual {
-                        if let Some(dst) = &other_dir {
-                            if ui
-                                .button("⇄ Kopieren →")
-                                .on_hover_text(format!("Direkt nach {} kopieren", dst.display()))
-                                .clicked()
-                            {
-                                self.panes[pane_idx].selected.clear();
-                                self.start_copy_or_move(selected_paths.clone(), dst.clone(), false);
-                            }
-                            if ui
-                                .button("⇄ Verschieben →")
-                                .on_hover_text(format!("Direkt nach {} verschieben", dst.display()))
-                                .clicked()
-                            {
-                                self.panes[pane_idx].selected.clear();
-                                self.start_copy_or_move(selected_paths.clone(), dst.clone(), true);
-                            }
-                        }
-                    }
-
-                    // Single-item actions
-                    if count == 1 {
-                        let single = &selected_entries[0];
-                        if ui.button("✏ Umbenennen").clicked() {
-                            self.dialog = Some(DialogState::Rename {
-                                pane: pane_idx,
-                                target: single.path.clone(),
-                                new_name: single.name.clone(),
-                            });
-                        }
-                        if single.is_zip() && ui.button("📂 Entpacken").clicked() {
-                            let stem = single
-                                .path
-                                .file_stem()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| "Entpackt".to_string());
-                            self.dialog = Some(DialogState::ExtractZip {
-                                pane: pane_idx,
-                                zip_path: single.path.clone(),
-                                subfolder_name: stem,
-                                extract_into_subfolder: true,
-                            });
-                        }
-                    }
-
-                    // Compress to ZIP
-                    if ui.button("📦 ZIP erstellen").clicked() {
-                        let default_name = if count == 1 {
-                            format!("{}.zip", selected_entries[0].name)
-                        } else {
-                            "Archiv.zip".to_string()
-                        };
-                        self.dialog = Some(DialogState::CompressZip {
-                            pane: pane_idx,
-                            sources: selected_paths.clone(),
-                            archive_name: default_name,
-                        });
-                    }
-
-                    // Share
-                    if selected_entries.iter().all(|e| !e.is_dir) && ui.button("↗ Teilen").clicked()
-                    {
-                        if let Err(e) = self.bridge.share_files(&selected_paths) {
-                            self.show_toast(e, true);
-                        }
-                    }
-
-                    // Delete
-                    if ui
-                        .button(RichText::new("🗑 Löschen").color(Color32::from_rgb(254, 202, 202)))
-                        .clicked()
-                    {
-                        self.dialog = Some(DialogState::ConfirmDelete {
-                            pane: pane_idx,
-                            targets: selected_paths.clone(),
-                            permanent: false,
-                        });
-                    }
-                });
-            });
-    }
-
-    fn draw_clipboard_bar(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        let count = self.clipboard.paths.len();
-        let is_move = self.clipboard.action == Some(ClipboardAction::Move);
-        let label = if is_move {
-            format!("✂ {count} Element(e) zum Verschieben bereit")
-        } else {
-            format!("📋 {count} Element(e) zum Kopieren bereit")
-        };
-
-        let target_dir = self.panes[self.active_pane]
-            .current_dir()
-            .map(Path::to_path_buf);
-
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(label).strong().color(p.text_primary));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Abbrechen").clicked() {
-                    self.clipboard = ClipboardState::default();
-                }
-                if let Some(dir) = target_dir {
-                    let btn = egui::Button::new(
-                        RichText::new("📥 Hier einfügen")
-                            .strong()
-                            .color(Color32::WHITE),
-                    )
-                    .fill(p.accent);
-                    if ui.add(btn).clicked() {
-                        let srcs = self.clipboard.paths.clone();
-                        self.start_copy_or_move(srcs, dir, is_move);
-                    }
-                }
-            });
-        });
+        if add_tab {
+            let root = self.primary_root.clone();
+            self.add_tab(pane_idx, Location::Dir(root));
+        }
     }
 
     fn draw_home_dashboard(&mut self, ui: &mut egui::Ui, pane_idx: usize, p: &Palette) {
         let mut nav_target: Option<Location> = None;
 
         ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             ui.label(
-                RichText::new("Willkommen in TabManager")
-                    .size(22.0)
-                    .strong()
-                    .color(p.text_primary),
-            );
-            ui.label(
-                RichText::new("Nativer Rust-Dateimanager — optimiert für das Galaxy Tab S12 Ultra")
+                RichText::new("Speicherübersicht")
                     .size(13.0)
-                    .color(p.text_secondary),
+                    .strong()
+                    .color(p.text_muted),
             );
-            ui.add_space(16.0);
+            ui.add_space(10.0);
 
-            // Storage Cards
-            ui.label(RichText::new("SPEICHERBEREICHE").size(12.0).strong().color(p.text_muted));
-            ui.add_space(8.0);
+            // Hero Storage Cards
             let volumes = self.storage_volumes.clone();
             ui.horizontal_wrapped(|ui| {
                 for vol in &volumes {
                     let resp = Frame::NONE
-                        .fill(p.bg_card)
-                        .corner_radius(CornerRadius::same(14))
-                        .stroke(Stroke::new(1.0, p.border))
-                        .inner_margin(Margin::same(16))
+                        .fill(p.bg_surface)
+                        .corner_radius(CornerRadius::same(16))
+                        .stroke(Stroke::new(1.0, p.divider))
+                        .inner_margin(Margin::same(18))
                         .show(ui, |ui| {
-                            ui.set_width(260.0);
-                            let icon = if vol.is_removable { "💾" } else { "📱" };
-                            ui.label(
-                                RichText::new(format!("{icon}  {}", vol.name))
-                                    .size(16.0)
-                                    .strong()
-                                    .color(p.text_primary),
-                            );
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(vol.path.to_string_lossy())
-                                    .size(11.0)
-                                    .color(p.text_muted),
-                            );
+                            ui.set_width(300.0);
+                            ui.horizontal(|ui| {
+                                category_icon_badge(
+                                    ui,
+                                    FileCategory::Document,
+                                    44.0,
+                                    if vol.is_removable { p.warning } else { p.accent },
+                                );
+                                ui.add_space(6.0);
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new(&vol.name)
+                                            .size(16.0)
+                                            .strong()
+                                            .color(p.text_primary),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{:.0}% belegt",
+                                            vol.used_fraction() * 100.0
+                                        ))
+                                        .size(12.5)
+                                        .color(p.text_secondary),
+                                    );
+                                });
+                            });
+                            ui.add_space(14.0);
+                            self.draw_slim_bar(ui, vol.used_fraction(), p.accent, p.bg_hover, 8.0);
                             ui.add_space(10.0);
-                            ui.add(
-                                egui::ProgressBar::new(vol.used_fraction())
-                                    .desired_height(8.0)
-                                    .fill(p.accent),
-                            );
-                            ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(format!("Belegt: {}", format_size(vol.used_bytes())))
-                                        .size(12.0)
+                                        .size(12.5)
                                         .color(p.text_secondary),
                                 );
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.label(
                                         RichText::new(format!("Frei: {}", format_size(vol.free_bytes)))
-                                            .size(12.0)
+                                            .size(12.5)
                                             .strong()
                                             .color(p.cyan),
                                     );
@@ -1623,40 +1841,52 @@ impl TabManagerApp {
                     if resp.clicked() {
                         nav_target = Some(Location::Dir(vol.path.clone()));
                     }
+                    ui.add_space(6.0);
                 }
             });
 
-            ui.add_space(20.0);
-            ui.label(RichText::new("KATEGORIEN").size(12.0).strong().color(p.text_muted));
-            ui.add_space(8.0);
+            ui.add_space(24.0);
+            ui.label(
+                RichText::new("Kategorien")
+                    .size(13.0)
+                    .strong()
+                    .color(p.text_muted),
+            );
+            ui.add_space(10.0);
 
             let cats = [
-                ("🖼", "Bilder", FileCategory::Image),
-                ("🎬", "Videos", FileCategory::Video),
-                ("🎵", "Audio", FileCategory::Audio),
-                ("📑", "Dokumente", FileCategory::Document),
-                ("📦", "Archive (ZIP)", FileCategory::Archive),
-                ("🤖", "APKs", FileCategory::Apk),
+                ("Bilder", "Fotos & Screenshots", FileCategory::Image),
+                ("Videos", "Filme & Aufnahmen", FileCategory::Video),
+                ("Audio", "Musik & Sprachmemos", FileCategory::Audio),
+                ("Dokumente", "PDF, Office & Text", FileCategory::Document),
+                ("Archive", "ZIP & komprimiert", FileCategory::Archive),
+                ("APKs", "Installationspakete", FileCategory::Apk),
             ];
+
             ui.horizontal_wrapped(|ui| {
-                for (icon, title, cat) in cats {
-                    let accent = Palette::category_color(cat);
+                for (title, subtitle, cat) in cats {
+                    let color = Palette::category_color(cat);
                     let resp = Frame::NONE
-                        .fill(p.bg_card)
-                        .corner_radius(CornerRadius::same(14))
-                        .stroke(Stroke::new(1.0, p.border))
-                        .inner_margin(Margin::same(14))
+                        .fill(p.bg_surface)
+                        .corner_radius(CornerRadius::same(16))
+                        .stroke(Stroke::new(1.0, p.divider))
+                        .inner_margin(Margin::same(16))
                         .show(ui, |ui| {
-                            ui.set_width(150.0);
+                            ui.set_width(210.0);
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(icon).size(24.0).color(accent));
+                                category_icon_badge(ui, cat, 44.0, color);
                                 ui.add_space(6.0);
                                 ui.vertical(|ui| {
                                     ui.label(
-                                        RichText::new(title).strong().color(p.text_primary),
+                                        RichText::new(title)
+                                            .size(15.0)
+                                            .strong()
+                                            .color(p.text_primary),
                                     );
                                     ui.label(
-                                        RichText::new("Durchsuchen").size(11.0).color(p.text_muted),
+                                        RichText::new(subtitle)
+                                            .size(11.5)
+                                            .color(p.text_muted),
                                     );
                                 });
                             });
@@ -1665,6 +1895,40 @@ impl TabManagerApp {
                         .interact(Sense::click());
                     if resp.clicked() {
                         nav_target = Some(Location::Special(SpecialView::Category(cat)));
+                    }
+                    ui.add_space(4.0);
+                }
+            });
+
+            ui.add_space(24.0);
+            ui.label(
+                RichText::new("Schnellordner")
+                    .size(13.0)
+                    .strong()
+                    .color(p.text_muted),
+            );
+            ui.add_space(10.0);
+
+            let quick_dirs = [
+                ("Downloads", self.primary_root.join("Download")),
+                ("Dokumente", self.primary_root.join("Documents")),
+                ("Kamera (DCIM)", self.primary_root.join("DCIM")),
+                ("Bilder", self.primary_root.join("Pictures")),
+            ];
+            ui.horizontal_wrapped(|ui| {
+                for (name, path) in quick_dirs {
+                    if pill_button(
+                        ui,
+                        Icon::Folder,
+                        name,
+                        p.bg_surface,
+                        p.bg_hover,
+                        p.text_primary,
+                        Some(150.0),
+                    )
+                    .clicked()
+                    {
+                        nav_target = Some(Location::Dir(path));
                     }
                 }
             });
@@ -1675,31 +1939,46 @@ impl TabManagerApp {
         }
     }
 
-    fn draw_trash_view(&mut self, ui: &mut egui::Ui, _pane_idx: usize, p: &Palette) {
+    fn draw_trash_view(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let mut restore_item: Option<TrashItem> = None;
         let mut delete_item: Option<TrashItem> = None;
 
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("{} Element(e) im Papierkorb", self.trash_items.len()))
-                    .strong()
-                    .color(p.text_primary),
+                    .size(13.5)
+                    .color(p.text_secondary),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if !self.trash_items.is_empty()
-                    && ui
-                        .button(RichText::new("🗑 Papierkorb leeren").color(p.danger))
-                        .clicked()
+                    && pill_button(
+                        ui,
+                        Icon::Trash,
+                        "Papierkorb leeren",
+                        p.danger_soft,
+                        p.danger,
+                        p.danger,
+                        None,
+                    )
+                    .clicked()
                 {
                     self.dialog = Some(DialogState::ConfirmEmptyTrash);
                 }
             });
         });
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
         if self.trash_items.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("Der Papierkorb ist leer.").color(p.text_muted));
+                ui.vertical_centered(|ui| {
+                    icon_widget(ui, Icon::Trash, 42.0, p.text_muted);
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Der Papierkorb ist leer.")
+                            .size(15.0)
+                            .color(p.text_muted),
+                    );
+                });
             });
             return;
         }
@@ -1708,30 +1987,71 @@ impl TabManagerApp {
         ScrollArea::vertical().show(ui, |ui| {
             for item in items {
                 Frame::NONE
-                    .fill(p.bg_card)
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(Margin::symmetric(12, 8))
+                    .fill(p.bg_surface)
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(Margin::symmetric(14, 10))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(if item.is_dir { "📁" } else { "📄" });
+                            category_icon_badge(
+                                ui,
+                                if item.is_dir {
+                                    FileCategory::Folder
+                                } else {
+                                    FileCategory::Other
+                                },
+                                36.0,
+                                if item.is_dir {
+                                    Palette::category_color(FileCategory::Folder)
+                                } else {
+                                    p.text_secondary
+                                },
+                            );
+                            ui.add_space(6.0);
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(&item.original_name).strong().color(p.text_primary));
+                                ui.label(
+                                    RichText::new(&item.original_name)
+                                        .size(14.5)
+                                        .strong()
+                                        .color(p.text_primary),
+                                );
                                 ui.label(
                                     RichText::new(format!(
-                                        "Ursprung: {} • {} • {}",
+                                        "{}  •  {}  •  {}",
                                         item.original_path.display(),
                                         format_size(item.size),
                                         format_timestamp(item.deleted_at_secs)
                                     ))
-                                    .size(11.0)
+                                    .size(11.5)
                                     .color(p.text_muted),
                                 );
                             });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button(RichText::new("Löschen").color(p.danger)).clicked() {
+                                if icon_button(
+                                    ui,
+                                    Icon::Trash,
+                                    false,
+                                    true,
+                                    p.danger_soft,
+                                    p.danger_soft,
+                                    p.danger,
+                                    p.danger,
+                                )
+                                .on_hover_text("Endgültig löschen")
+                                .clicked()
+                                {
                                     delete_item = Some(item.clone());
                                 }
-                                if ui.button("↩ Wiederherstellen").clicked() {
+                                if pill_button(
+                                    ui,
+                                    Icon::Restore,
+                                    "Wiederherstellen",
+                                    p.bg_hover,
+                                    p.accent_soft,
+                                    p.text_primary,
+                                    None,
+                                )
+                                .clicked()
+                                {
                                     restore_item = Some(item.clone());
                                 }
                             });
@@ -1770,7 +2090,7 @@ impl TabManagerApp {
     ) {
         if let Some(err) = self.panes[pane_idx].error.clone() {
             ui.centered_and_justified(|ui| {
-                ui.label(RichText::new(err).color(p.danger));
+                ui.label(RichText::new(err).size(14.5).color(p.danger));
             });
             return;
         }
@@ -1779,7 +2099,7 @@ impl TabManagerApp {
             ui.centered_and_justified(|ui| {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Lade Dateien…");
+                    ui.label(RichText::new("Lade Dateien…").color(p.text_secondary));
                 });
             });
             return;
@@ -1800,57 +2120,155 @@ impl TabManagerApp {
 
         if entries.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("Keine Dateien in diesem Ordner.").color(p.text_muted));
+                ui.vertical_centered(|ui| {
+                    icon_widget(ui, Icon::Folder, 44.0, p.text_muted);
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Dieser Ordner ist leer.")
+                            .size(15.0)
+                            .color(p.text_muted),
+                    );
+                });
             });
             return;
+        }
+
+        // Request async thumbnails for visible image entries
+        for entry in entries.iter().take(60) {
+            if entry.is_image() {
+                self.request_thumbnail(entry);
+            }
         }
 
         let mut open_target: Option<FileEntry> = None;
         let mut toggle_select: Option<PathBuf> = None;
         let mut set_active = false;
         let mut context_action: Option<(String, FileEntry)> = None;
+        let mut sort_click: Option<SortBy> = None;
+
+        // Clean Table Column Header in List Mode
+        if self.prefs.view_mode == ViewMode::List {
+            let show_cols = ui.available_width() >= 540.0;
+            Frame::NONE
+                .inner_margin(Margin::symmetric(12, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(74.0);
+                        let name_hdr = self.col_header_label("Name", SortBy::Name);
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new(name_hdr)
+                                        .size(12.0)
+                                        .strong()
+                                        .color(p.text_muted),
+                                )
+                                .sense(Sense::click()),
+                            )
+                            .clicked()
+                        {
+                            sort_click = Some(SortBy::Name);
+                        }
+
+                        if show_cols {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.add_space(40.0);
+                                ui.allocate_ui(vec2(125.0, 20.0), |ui| {
+                                    let date_hdr = self.col_header_label("Geändert", SortBy::Date);
+                                    if ui
+                                        .add(
+                                            egui::Label::new(
+                                                RichText::new(date_hdr)
+                                                    .size(12.0)
+                                                    .strong()
+                                                    .color(p.text_muted),
+                                            )
+                                            .sense(Sense::click()),
+                                        )
+                                        .clicked()
+                                    {
+                                        sort_click = Some(SortBy::Date);
+                                    }
+                                });
+                                ui.allocate_ui(vec2(90.0, 20.0), |ui| {
+                                    let size_hdr = self.col_header_label("Größe", SortBy::Size);
+                                    if ui
+                                        .add(
+                                            egui::Label::new(
+                                                RichText::new(size_hdr)
+                                                    .size(12.0)
+                                                    .strong()
+                                                    .color(p.text_muted),
+                                            )
+                                            .sense(Sense::click()),
+                                        )
+                                        .clicked()
+                                    {
+                                        sort_click = Some(SortBy::Size);
+                                    }
+                                });
+                            });
+                        }
+                    });
+                });
+            // Subtle hairline divider below table header
+            let (line_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+            ui.painter().rect_filled(line_rect, CornerRadius::ZERO, p.divider);
+        }
 
         ScrollArea::vertical()
             .id_salt(format!("pane_scroll_{pane_idx}"))
             .show(ui, |ui| match self.prefs.view_mode {
                 ViewMode::List => {
+                    let show_cols = ui.available_width() >= 540.0;
                     for entry in &entries {
                         let is_sel = self.panes[pane_idx].selected.contains(&entry.path);
-                        let fill = if is_sel { p.bg_selected } else { p.bg_card };
-                        let stroke = Stroke::new(1.0, if is_sel { p.accent } else { Color32::TRANSPARENT });
+                        let row_bg = if is_sel {
+                            p.bg_selected
+                        } else {
+                            Color32::TRANSPARENT
+                        };
 
                         let resp = Frame::NONE
-                            .fill(fill)
+                            .fill(row_bg)
                             .corner_radius(CornerRadius::same(10))
-                            .stroke(stroke)
-                            .inner_margin(Margin::symmetric(10, 8))
+                            .inner_margin(Margin::symmetric(10, 7))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    // Selection checkbox
+                                    // Selection circle/checkbox
                                     let mut checked = is_sel;
                                     if ui.checkbox(&mut checked, "").changed() {
                                         toggle_select = Some(entry.path.clone());
                                         set_active = true;
                                     }
 
-                                    // Colored category badge
-                                    let cat_color = Palette::category_color(entry.category);
-                                    Frame::NONE
-                                        .fill(cat_color.gamma_multiply(0.18))
-                                        .corner_radius(CornerRadius::same(8))
-                                        .inner_margin(Margin::symmetric(8, 4))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                RichText::new(entry.category.badge())
-                                                    .size(11.0)
-                                                    .strong()
-                                                    .color(cat_color),
-                                            );
-                                        });
+                                    // Real image thumbnail OR crisp vector category badge
+                                    if let Some(tex) = self.thumbs.get(&entry.path) {
+                                        let (r, _) = ui.allocate_exact_size(vec2(38.0, 38.0), Sense::hover());
+                                        ui.painter().image(
+                                            tex.id(),
+                                            r,
+                                            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                            Color32::WHITE,
+                                        );
+                                        ui.painter().rect_stroke(
+                                            r,
+                                            CornerRadius::same(8),
+                                            Stroke::new(1.0, p.divider),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    } else {
+                                        category_icon_badge(
+                                            ui,
+                                            entry.category,
+                                            38.0,
+                                            Palette::category_color(entry.category),
+                                        );
+                                    }
 
-                                    ui.add_space(4.0);
+                                    ui.add_space(6.0);
 
-                                    // Name & metadata
+                                    // Filename (and compact subtitle on narrow screens)
                                     ui.vertical(|ui| {
                                         ui.label(
                                             RichText::new(&entry.name)
@@ -1858,63 +2276,63 @@ impl TabManagerApp {
                                                 .strong()
                                                 .color(p.text_primary),
                                         );
-                                        let sub = if entry.is_dir {
-                                            format!(
-                                                "{} Elemente • {}",
-                                                entry.child_count.unwrap_or(0),
-                                                format_timestamp(entry.modified_secs)
-                                            )
-                                        } else {
-                                            format!(
-                                                "{} • {}",
-                                                format_size(entry.size),
-                                                format_timestamp(entry.modified_secs)
-                                            )
-                                        };
-                                        ui.label(RichText::new(sub).size(11.5).color(p.text_secondary));
+                                        if !show_cols {
+                                            let sub = if entry.is_dir {
+                                                format!("{} Elemente", entry.child_count.unwrap_or(0))
+                                            } else {
+                                                format!(
+                                                    "{}  •  {}",
+                                                    format_size(entry.size),
+                                                    format_timestamp(entry.modified_secs)
+                                                )
+                                            };
+                                            ui.label(RichText::new(sub).size(11.5).color(p.text_muted));
+                                        } else if entry.is_dir {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} Elemente",
+                                                    entry.child_count.unwrap_or(0)
+                                                ))
+                                                .size(11.5)
+                                                .color(p.text_muted),
+                                            );
+                                        }
                                     });
 
-                                    // Quick right-side menu button
+                                    // Right-aligned columns + overflow menu
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.menu_button("⋮", |ui| {
-                                            if ui.button("Öffnen").clicked() {
-                                                context_action = Some(("open".into(), entry.clone()));
-                                                ui.close();
-                                            }
-                                            if !entry.is_dir && ui.button("Mit anderer App öffnen").clicked() {
-                                                context_action = Some(("open_ext".into(), entry.clone()));
-                                                ui.close();
-                                            }
-                                            if ui.button("Kopieren").clicked() {
-                                                context_action = Some(("copy".into(), entry.clone()));
-                                                ui.close();
-                                            }
-                                            if ui.button("Ausschneiden").clicked() {
-                                                context_action = Some(("cut".into(), entry.clone()));
-                                                ui.close();
-                                            }
-                                            if ui.button("Umbenennen").clicked() {
-                                                context_action = Some(("rename".into(), entry.clone()));
-                                                ui.close();
-                                            }
-                                            if entry.is_zip() && ui.button("ZIP entpacken…").clicked() {
-                                                context_action = Some(("unzip".into(), entry.clone()));
-                                                ui.close();
-                                            }
-                                            if ui.button("In ZIP komprimieren…").clicked() {
-                                                context_action = Some(("zip".into(), entry.clone()));
-                                                ui.close();
-                                            }
-                                            if !entry.is_dir && ui.button("Teilen").clicked() {
-                                                context_action = Some(("share".into(), entry.clone()));
-                                                ui.close();
-                                            }
-                                            ui.separator();
-                                            if ui.button(RichText::new("Löschen").color(p.danger)).clicked() {
-                                                context_action = Some(("delete".into(), entry.clone()));
-                                                ui.close();
-                                            }
+                                        ui.menu_button("...", |ui| {
+                                            self.draw_entry_context_menu(
+                                                ui,
+                                                entry,
+                                                p,
+                                                &mut context_action,
+                                            );
                                         });
+
+                                        if show_cols {
+                                            ui.allocate_ui(vec2(125.0, 22.0), |ui| {
+                                                ui.label(
+                                                    RichText::new(format_timestamp(
+                                                        entry.modified_secs,
+                                                    ))
+                                                    .size(12.5)
+                                                    .color(p.text_secondary),
+                                                );
+                                            });
+                                            ui.allocate_ui(vec2(90.0, 22.0), |ui| {
+                                                let sz = if entry.is_dir {
+                                                    "—".to_string()
+                                                } else {
+                                                    format_size(entry.size)
+                                                };
+                                                ui.label(
+                                                    RichText::new(sz)
+                                                        .size(12.5)
+                                                        .color(p.text_secondary),
+                                                );
+                                            });
+                                        }
                                     });
                                 });
                             })
@@ -1932,13 +2350,20 @@ impl TabManagerApp {
                             set_active = true;
                             toggle_select = Some(entry.path.clone());
                         }
-                        ui.add_space(4.0);
+
+                        // Subtle row divider
+                        let (div_r, _) =
+                            ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                        ui.painter()
+                            .rect_filled(div_r, CornerRadius::ZERO, p.divider);
                     }
+                    // Bottom breathing room for floating selection pill
+                    ui.add_space(76.0);
                 }
                 ViewMode::Grid => {
                     let avail_w = ui.available_width();
-                    let tile_w = 152.0;
-                    let cols = ((avail_w / (tile_w + 10.0)).floor() as usize).max(2);
+                    let tile_w = 160.0;
+                    let cols = ((avail_w / (tile_w + 12.0)).floor() as usize).max(2);
 
                     for chunk in entries.chunks(cols) {
                         ui.horizontal(|ui| {
@@ -1946,44 +2371,81 @@ impl TabManagerApp {
                                 let is_sel = self.panes[pane_idx].selected.contains(&entry.path);
                                 let cat_color = Palette::category_color(entry.category);
                                 let resp = Frame::NONE
-                                    .fill(if is_sel { p.bg_selected } else { p.bg_card })
-                                    .corner_radius(CornerRadius::same(12))
+                                    .fill(if is_sel { p.bg_selected } else { p.bg_surface })
+                                    .corner_radius(CornerRadius::same(16))
                                     .stroke(Stroke::new(
-                                        1.0,
-                                        if is_sel { p.accent } else { p.border },
+                                        if is_sel { 1.5 } else { 1.0 },
+                                        if is_sel { p.accent } else { p.divider },
                                     ))
-                                    .inner_margin(Margin::same(10))
+                                    .inner_margin(Margin::same(12))
                                     .show(ui, |ui| {
-                                        ui.set_width(tile_w - 20.0);
-                                        ui.set_height(110.0);
+                                        ui.set_width(tile_w - 24.0);
+                                        ui.set_height(138.0);
                                         ui.horizontal(|ui| {
                                             let mut checked = is_sel;
                                             if ui.checkbox(&mut checked, "").changed() {
                                                 toggle_select = Some(entry.path.clone());
                                                 set_active = true;
                                             }
-                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                ui.label(
-                                                    RichText::new(entry.category.badge())
-                                                        .size(11.0)
-                                                        .strong()
-                                                        .color(cat_color),
-                                                );
-                                            });
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    ui.menu_button("...", |ui| {
+                                                        self.draw_entry_context_menu(
+                                                            ui,
+                                                            entry,
+                                                            p,
+                                                            &mut context_action,
+                                                        );
+                                                    });
+                                                },
+                                            );
                                         });
-                                        ui.add_space(8.0);
-                                        ui.label(
-                                            RichText::new(&entry.name)
-                                                .size(13.0)
-                                                .strong()
-                                                .color(p.text_primary),
-                                        );
-                                        let sub = if entry.is_dir {
-                                            format!("{} Elem.", entry.child_count.unwrap_or(0))
-                                        } else {
-                                            format_size(entry.size)
-                                        };
-                                        ui.label(RichText::new(sub).size(11.0).color(p.text_muted));
+                                        ui.vertical_centered(|ui| {
+                                            if let Some(tex) = self.thumbs.get(&entry.path) {
+                                                let (r, _) = ui.allocate_exact_size(
+                                                    vec2(58.0, 58.0),
+                                                    Sense::hover(),
+                                                );
+                                                ui.painter().image(
+                                                    tex.id(),
+                                                    r,
+                                                    Rect::from_min_max(
+                                                        egui::pos2(0.0, 0.0),
+                                                        egui::pos2(1.0, 1.0),
+                                                    ),
+                                                    Color32::WHITE,
+                                                );
+                                            } else {
+                                                category_icon_badge(
+                                                    ui,
+                                                    entry.category,
+                                                    54.0,
+                                                    cat_color,
+                                                );
+                                            }
+                                            ui.add_space(8.0);
+                                            let short_name = truncate_middle(&entry.name, 18);
+                                            ui.label(
+                                                RichText::new(short_name)
+                                                    .size(13.0)
+                                                    .strong()
+                                                    .color(p.text_primary),
+                                            );
+                                            let sub = if entry.is_dir {
+                                                format!(
+                                                    "{} Elemente",
+                                                    entry.child_count.unwrap_or(0)
+                                                )
+                                            } else {
+                                                format_size(entry.size)
+                                            };
+                                            ui.label(
+                                                RichText::new(sub)
+                                                    .size(11.0)
+                                                    .color(p.text_muted),
+                                            );
+                                        });
                                     })
                                     .response
                                     .interact(Sense::click());
@@ -1999,13 +2461,18 @@ impl TabManagerApp {
                                     set_active = true;
                                     toggle_select = Some(entry.path.clone());
                                 }
+                                ui.add_space(4.0);
                             }
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(8.0);
                     }
+                    ui.add_space(76.0);
                 }
             });
 
+        if let Some(by) = sort_click {
+            self.set_sort(by);
+        }
         if set_active {
             self.active_pane = pane_idx;
         }
@@ -2042,7 +2509,6 @@ impl TabManagerApp {
                 }
                 "rename" => {
                     self.dialog = Some(DialogState::Rename {
-                        pane: pane_idx,
                         target: entry.path,
                         new_name: entry.name,
                     });
@@ -2084,23 +2550,299 @@ impl TabManagerApp {
         }
     }
 
+    fn col_header_label(&self, title: &str, by: SortBy) -> String {
+        if self.prefs.sort_by == by {
+            match self.prefs.sort_order {
+                SortOrder::Ascending => format!("{title}  ▲"),
+                SortOrder::Descending => format!("{title}  ▼"),
+            }
+        } else {
+            title.to_string()
+        }
+    }
+
+    fn draw_entry_context_menu(
+        &self,
+        ui: &mut egui::Ui,
+        entry: &FileEntry,
+        p: &Palette,
+        out: &mut Option<(String, FileEntry)>,
+    ) {
+        if pill_button(ui, Icon::ExternalOpen, "Öffnen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
+            *out = Some(("open".into(), entry.clone()));
+            ui.close();
+        }
+        if !entry.is_dir && pill_button(ui, Icon::ExternalOpen, "Mit anderer App", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
+            *out = Some(("open_ext".into(), entry.clone()));
+            ui.close();
+        }
+        if pill_button(ui, Icon::Copy, "Kopieren", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
+            *out = Some(("copy".into(), entry.clone()));
+            ui.close();
+        }
+        if pill_button(ui, Icon::Cut, "Ausschneiden", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
+            *out = Some(("cut".into(), entry.clone()));
+            ui.close();
+        }
+        if pill_button(ui, Icon::Rename, "Umbenennen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
+            *out = Some(("rename".into(), entry.clone()));
+            ui.close();
+        }
+        if entry.is_zip() && pill_button(ui, Icon::Unzip, "ZIP entpacken…", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
+            *out = Some(("unzip".into(), entry.clone()));
+            ui.close();
+        }
+        if pill_button(ui, Icon::ZipAdd, "In ZIP packen…", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
+            *out = Some(("zip".into(), entry.clone()));
+            ui.close();
+        }
+        if !entry.is_dir && pill_button(ui, Icon::Share, "Teilen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
+            *out = Some(("share".into(), entry.clone()));
+            ui.close();
+        }
+        ui.separator();
+        if pill_button(ui, Icon::Trash, "Löschen", Color32::TRANSPARENT, p.danger_soft, p.danger, Some(190.0)).clicked() {
+            *out = Some(("delete".into(), entry.clone()));
+            ui.close();
+        }
+    }
+
+    fn draw_floating_selection_bar(
+        &mut self,
+        ctx: &egui::Context,
+        pane_idx: usize,
+        p: &Palette,
+        is_dual: bool,
+        bot_pad: f32,
+    ) {
+        let selected_entries = self.panes[pane_idx].selected_entries();
+        let selected_paths: Vec<PathBuf> = selected_entries.iter().map(|e| e.path.clone()).collect();
+        let count = selected_paths.len();
+        let other_pane = 1 - pane_idx;
+        let other_dir = self.panes[other_pane].current_dir().map(Path::to_path_buf);
+
+        let y_offset = if !self.clipboard.is_empty() {
+            -(78.0 + bot_pad)
+        } else {
+            -(20.0 + bot_pad)
+        };
+
+        egui::Area::new(egui::Id::NULL.with("floating_selection_bar"))
+            .anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(0.0, y_offset))
+            .show(ctx, |ui| {
+                Frame::NONE
+                    .fill(p.bg_floating)
+                    .corner_radius(CornerRadius::same(18))
+                    .stroke(Stroke::new(1.0, p.accent))
+                    .shadow(Shadow {
+                        offset: [0, 8],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(120),
+                    })
+                    .inner_margin(Margin::symmetric(14, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{count} ausgew."))
+                                    .size(13.5)
+                                    .strong()
+                                    .color(p.accent),
+                            );
+
+                            if ui.button("Alle").clicked() {
+                                let all: Vec<PathBuf> = self.panes[pane_idx]
+                                    .entries
+                                    .iter()
+                                    .map(|e| e.path.clone())
+                                    .collect();
+                                self.panes[pane_idx].selected.extend(all);
+                            }
+
+                            ui.separator();
+
+                            if pill_button(ui, Icon::Copy, "Kopieren", Color32::TRANSPARENT, p.bg_hover, p.text_primary, None).clicked() {
+                                self.clipboard = ClipboardState {
+                                    paths: selected_paths.clone(),
+                                    action: Some(ClipboardAction::Copy),
+                                };
+                                self.panes[pane_idx].selected.clear();
+                                self.show_toast(format!("{count} Element(e) zum Kopieren gemerkt"), false);
+                            }
+                            if pill_button(ui, Icon::Cut, "Verschieben", Color32::TRANSPARENT, p.bg_hover, p.text_primary, None).clicked() {
+                                self.clipboard = ClipboardState {
+                                    paths: selected_paths.clone(),
+                                    action: Some(ClipboardAction::Move),
+                                };
+                                self.panes[pane_idx].selected.clear();
+                                self.show_toast(format!("{count} Element(e) zum Verschieben gemerkt"), false);
+                            }
+
+                            if is_dual {
+                                if let Some(dst) = &other_dir {
+                                    if pill_button(ui, Icon::Transfer, "→ Kopieren", p.accent_soft, p.accent, p.text_primary, None).clicked() {
+                                        self.panes[pane_idx].selected.clear();
+                                        self.start_copy_or_move(selected_paths.clone(), dst.clone(), false);
+                                    }
+                                    if pill_button(ui, Icon::Transfer, "→ Verschieben", p.accent_soft, p.accent, p.text_primary, None).clicked() {
+                                        self.panes[pane_idx].selected.clear();
+                                        self.start_copy_or_move(selected_paths.clone(), dst.clone(), true);
+                                    }
+                                }
+                            }
+
+                            if count == 1 {
+                                let single = &selected_entries[0];
+                                if pill_button(ui, Icon::Rename, "Umbenennen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, None).clicked() {
+                                    self.dialog = Some(DialogState::Rename {
+                                        target: single.path.clone(),
+                                        new_name: single.name.clone(),
+                                    });
+                                }
+                                if single.is_zip() && pill_button(ui, Icon::Unzip, "Entpacken", Color32::TRANSPARENT, p.bg_hover, p.cyan, None).clicked() {
+                                    let stem = single
+                                        .path
+                                        .file_stem()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "Entpackt".to_string());
+                                    self.dialog = Some(DialogState::ExtractZip {
+                                        pane: pane_idx,
+                                        zip_path: single.path.clone(),
+                                        subfolder_name: stem,
+                                        extract_into_subfolder: true,
+                                    });
+                                }
+                            }
+
+                            if pill_button(ui, Icon::ZipAdd, "ZIP", Color32::TRANSPARENT, p.bg_hover, p.text_primary, None).clicked() {
+                                let default_name = if count == 1 {
+                                    format!("{}.zip", selected_entries[0].name)
+                                } else {
+                                    "Archiv.zip".to_string()
+                                };
+                                self.dialog = Some(DialogState::CompressZip {
+                                    pane: pane_idx,
+                                    sources: selected_paths.clone(),
+                                    archive_name: default_name,
+                                });
+                            }
+
+                            if selected_entries.iter().all(|e| !e.is_dir)
+                                && pill_button(ui, Icon::Share, "Teilen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, None).clicked()
+                            {
+                                if let Err(e) = self.bridge.share_files(&selected_paths) {
+                                    self.show_toast(e, true);
+                                }
+                            }
+
+                            if pill_button(ui, Icon::Trash, "Löschen", p.danger_soft, p.danger, p.danger, None).clicked() {
+                                self.dialog = Some(DialogState::ConfirmDelete {
+                                    pane: pane_idx,
+                                    targets: selected_paths.clone(),
+                                    permanent: false,
+                                });
+                            }
+
+                            if icon_button(
+                                ui,
+                                Icon::Close,
+                                false,
+                                true,
+                                p.bg_hover,
+                                p.accent_soft,
+                                p.text_muted,
+                                p.text_primary,
+                            )
+                            .clicked()
+                            {
+                                self.panes[pane_idx].selected.clear();
+                            }
+                        });
+                    });
+            });
+    }
+
+    fn draw_clipboard_bar(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let count = self.clipboard.paths.len();
+        let is_move = self.clipboard.action == Some(ClipboardAction::Move);
+        let label = if is_move {
+            format!("{count} Element(e) zum Verschieben bereit")
+        } else {
+            format!("{count} Element(e) zum Kopieren bereit")
+        };
+
+        let target_dir = self.panes[self.active_pane]
+            .current_dir()
+            .map(Path::to_path_buf);
+
+        ui.horizontal(|ui| {
+            icon_widget(
+                ui,
+                if is_move { Icon::Cut } else { Icon::Copy },
+                18.0,
+                p.accent,
+            );
+            ui.label(RichText::new(label).size(14.0).strong().color(p.text_primary));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Abbrechen").clicked() {
+                    self.clipboard = ClipboardState::default();
+                }
+                if let Some(dir) = target_dir {
+                    if pill_button(
+                        ui,
+                        Icon::Paste,
+                        "Hier einfügen",
+                        p.accent,
+                        p.accent_hover,
+                        Color32::WHITE,
+                        None,
+                    )
+                    .clicked()
+                    {
+                        let srcs = self.clipboard.paths.clone();
+                        self.start_copy_or_move(srcs, dir, is_move);
+                    }
+                }
+            });
+        });
+    }
+
     fn draw_inspector_panel(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        ui.label(RichText::new("INSPEKTOR").size(12.0).strong().color(p.text_muted));
-        ui.add_space(8.0);
+        ui.label(
+            RichText::new("DETAILS & INSPEKTOR")
+                .size(11.0)
+                .strong()
+                .color(p.text_muted),
+        );
+        ui.add_space(12.0);
 
         let selected = self.panes[self.active_pane].selected_entries();
         if selected.is_empty() {
-            ui.label(
-                RichText::new("Wähle eine Datei oder einen Ordner aus, um Details, Größe und SHA-256 zu sehen.")
-                    .color(p.text_secondary),
-            );
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                icon_widget(ui, Icon::Info, 36.0, p.text_muted);
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new("Markiere eine Datei oder einen Ordner für Details, Größe & SHA-256.")
+                        .size(13.0)
+                        .color(p.text_muted),
+                );
+            });
             return;
         }
 
         if selected.len() > 1 {
             let total_size: u64 = selected.iter().map(|e| e.size).sum();
-            ui.label(RichText::new(format!("{} Elemente ausgewählt", selected.len())).strong());
-            ui.label(format!("Gesamtgröße (Dateien): {}", format_size(total_size)));
+            ui.label(
+                RichText::new(format!("{} Elemente ausgewählt", selected.len()))
+                    .size(16.0)
+                    .strong(),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!("Gesamtgröße: {}", format_size(total_size)))
+                    .color(p.text_secondary),
+            );
             return;
         }
 
@@ -2108,21 +2850,40 @@ impl TabManagerApp {
         let cat_color = Palette::category_color(item.category);
 
         Frame::NONE
-            .fill(p.bg_card)
-            .corner_radius(CornerRadius::same(12))
-            .inner_margin(Margin::same(12))
+            .fill(p.bg_surface)
+            .corner_radius(CornerRadius::same(14))
+            .stroke(Stroke::new(1.0, p.divider))
+            .inner_margin(Margin::same(14))
             .show(ui, |ui| {
-                ui.label(RichText::new(item.category.badge()).strong().color(cat_color));
-                ui.add_space(4.0);
-                ui.label(RichText::new(&item.name).size(16.0).strong().color(p.text_primary));
+                ui.vertical_centered(|ui| {
+                    category_icon_badge(ui, item.category, 56.0, cat_color);
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(&item.name)
+                            .size(15.5)
+                            .strong()
+                            .color(p.text_primary),
+                    );
+                    ui.label(
+                        RichText::new(if item.is_dir {
+                            "Ordner"
+                        } else {
+                            item.category.label()
+                        })
+                        .size(12.0)
+                        .color(p.text_muted),
+                    );
+                });
+                ui.add_space(12.0);
+                ui.separator();
                 ui.add_space(8.0);
-                ui.label(RichText::new("Pfad:").size(11.0).color(p.text_muted));
-                ui.label(RichText::new(item.path.to_string_lossy()).size(11.5).color(p.text_secondary));
-                ui.add_space(6.0);
-                ui.label(format!(
-                    "Typ: {}",
-                    if item.is_dir { "Ordner" } else { item.category.label() }
-                ));
+                ui.label(RichText::new("Pfad").size(11.0).color(p.text_muted));
+                ui.label(
+                    RichText::new(item.path.to_string_lossy())
+                        .size(11.5)
+                        .color(p.text_secondary),
+                );
+                ui.add_space(8.0);
                 if !item.is_dir {
                     ui.label(format!("Größe: {}", format_size(item.size)));
                 }
@@ -2133,13 +2894,9 @@ impl TabManagerApp {
                 ));
             });
 
-        ui.add_space(10.0);
+        ui.add_space(12.0);
 
-        // Extra async info (SHA-256 or Folder Size)
-        let matching_extra = self
-            .inspector_extra
-            .as_ref()
-            .filter(|e| e.path == item.path);
+        let matching_extra = self.inspector_extra.as_ref().filter(|e| e.path == item.path);
 
         if item.is_dir {
             if let Some(extra) = matching_extra {
@@ -2149,11 +2906,23 @@ impl TabManagerApp {
                             "Ordnergröße: {} ({files} Dateien)",
                             format_size(bytes)
                         ))
+                        .strong()
                         .color(p.cyan),
                     );
+                    ui.add_space(6.0);
                 }
             }
-            if ui.button("📊 Ordnergröße berechnen").clicked() {
+            if pill_button(
+                ui,
+                Icon::Info,
+                "Ordnergröße berechnen",
+                p.bg_surface,
+                p.bg_hover,
+                p.text_primary,
+                Some(ui.available_width()),
+            )
+            .clicked()
+            {
                 let path = item.path.clone();
                 let (tx, rx) = mpsc::channel();
                 self.inspector_rx = Some(rx);
@@ -2169,11 +2938,22 @@ impl TabManagerApp {
         } else {
             if let Some(extra) = matching_extra {
                 if let Some(hash) = &extra.sha256 {
-                    ui.label(RichText::new("SHA-256:").size(11.0).color(p.text_muted));
+                    ui.label(RichText::new("SHA-256").size(11.0).color(p.text_muted));
                     ui.label(RichText::new(hash).monospace().size(10.5).color(p.cyan));
+                    ui.add_space(6.0);
                 }
             }
-            if ui.button("🔐 SHA-256 berechnen").clicked() {
+            if pill_button(
+                ui,
+                Icon::Hash,
+                "SHA-256 berechnen",
+                p.bg_surface,
+                p.bg_hover,
+                p.text_primary,
+                Some(ui.available_width()),
+            )
+            .clicked()
+            {
                 let path = item.path.clone();
                 let (tx, rx) = mpsc::channel();
                 self.inspector_rx = Some(rx);
@@ -2206,17 +2986,15 @@ impl TabManagerApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .min_width(380.0)
+            .min_width(400.0)
             .show(ctx, |ui| match dialog {
                 DialogState::NewFolder { pane, name } => {
-                    ui.label("Ordnername:");
-                    ui.text_edit_singleline(name);
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Abbrechen").clicked() {
-                            close = true;
-                        }
-                        if ui.button(RichText::new("Erstellen").strong()).clicked() {
+                    ui.label(RichText::new("Ordnername").size(13.0).color(p.text_secondary));
+                    ui.add_space(4.0);
+                    ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
+                    ui.add_space(16.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if pill_button(ui, Icon::Check, "Erstellen", p.accent, p.accent_hover, Color32::WHITE, None).clicked() {
                             let pane_i = *pane;
                             let folder_name = name.clone();
                             close = true;
@@ -2232,17 +3010,18 @@ impl TabManagerApp {
                                 }
                             }));
                         }
-                    });
-                }
-                DialogState::NewFile { pane, name } => {
-                    ui.label("Dateiname:");
-                    ui.text_edit_singleline(name);
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
                         if ui.button("Abbrechen").clicked() {
                             close = true;
                         }
-                        if ui.button(RichText::new("Erstellen").strong()).clicked() {
+                    });
+                }
+                DialogState::NewFile { pane, name } => {
+                    ui.label(RichText::new("Dateiname").size(13.0).color(p.text_secondary));
+                    ui.add_space(4.0);
+                    ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
+                    ui.add_space(16.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if pill_button(ui, Icon::Check, "Erstellen", p.accent, p.accent_hover, Color32::WHITE, None).clicked() {
                             let pane_i = *pane;
                             let file_name = name.clone();
                             close = true;
@@ -2258,21 +3037,18 @@ impl TabManagerApp {
                                 }
                             }));
                         }
-                    });
-                }
-                DialogState::Rename {
-                    pane: _,
-                    target,
-                    new_name,
-                } => {
-                    ui.label("Neuer Name:");
-                    ui.text_edit_singleline(new_name);
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
                         if ui.button("Abbrechen").clicked() {
                             close = true;
                         }
-                        if ui.button(RichText::new("Umbenennen").strong()).clicked() {
+                    });
+                }
+                DialogState::Rename { target, new_name } => {
+                    ui.label(RichText::new("Neuer Name").size(13.0).color(p.text_secondary));
+                    ui.add_space(4.0);
+                    ui.add(egui::TextEdit::singleline(new_name).desired_width(f32::INFINITY));
+                    ui.add_space(16.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if pill_button(ui, Icon::Check, "Umbenennen", p.accent, p.accent_hover, Color32::WHITE, None).clicked() {
                             let t = target.clone();
                             let n = new_name.clone();
                             close = true;
@@ -2284,6 +3060,9 @@ impl TabManagerApp {
                                 Err(e) => app.show_toast(e, true),
                             }));
                         }
+                        if ui.button("Abbrechen").clicked() {
+                            close = true;
+                        }
                     });
                 }
                 DialogState::CompressZip {
@@ -2291,14 +3070,16 @@ impl TabManagerApp {
                     sources,
                     archive_name,
                 } => {
-                    ui.label(format!("{} Element(e) in ZIP-Archiv packen:", sources.len()));
-                    ui.text_edit_singleline(archive_name);
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Abbrechen").clicked() {
-                            close = true;
-                        }
-                        if ui.button(RichText::new("📦 Komprimieren").strong()).clicked() {
+                    ui.label(
+                        RichText::new(format!("{} Element(e) in ZIP-Archiv packen", sources.len()))
+                            .size(13.5)
+                            .color(p.text_secondary),
+                    );
+                    ui.add_space(6.0);
+                    ui.add(egui::TextEdit::singleline(archive_name).desired_width(f32::INFINITY));
+                    ui.add_space(16.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if pill_button(ui, Icon::ZipAdd, "Komprimieren", p.accent, p.accent_hover, Color32::WHITE, None).clicked() {
                             let pane_i = *pane;
                             let srcs = sources.clone();
                             let name = archive_name.clone();
@@ -2310,6 +3091,9 @@ impl TabManagerApp {
                                 }
                             }));
                         }
+                        if ui.button("Abbrechen").clicked() {
+                            close = true;
+                        }
                     });
                 }
                 DialogState::ExtractZip {
@@ -2318,20 +3102,23 @@ impl TabManagerApp {
                     subfolder_name,
                     extract_into_subfolder,
                 } => {
-                    ui.label(format!(
-                        "Archiv: {}",
-                        zip_path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
+                    ui.label(
+                        RichText::new(format!(
+                            "Archiv: {}",
+                            zip_path.file_name().unwrap_or_default().to_string_lossy()
+                        ))
+                        .size(13.5)
+                        .color(p.text_secondary),
+                    );
+                    ui.add_space(8.0);
                     ui.checkbox(extract_into_subfolder, "In neuen Unterordner entpacken");
                     if *extract_into_subfolder {
-                        ui.text_edit_singleline(subfolder_name);
+                        ui.add_space(4.0);
+                        ui.add(egui::TextEdit::singleline(subfolder_name).desired_width(f32::INFINITY));
                     }
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Abbrechen").clicked() {
-                            close = true;
-                        }
-                        if ui.button(RichText::new("📂 Entpacken").strong()).clicked() {
+                    ui.add_space(16.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if pill_button(ui, Icon::Unzip, "Entpacken", p.accent, p.accent_hover, Color32::WHITE, None).clicked() {
                             let pane_i = *pane;
                             let zp = zip_path.clone();
                             let sub = if *extract_into_subfolder {
@@ -2350,6 +3137,9 @@ impl TabManagerApp {
                                 app.start_extract_zip(zp, dest, sub);
                             }));
                         }
+                        if ui.button("Abbrechen").clicked() {
+                            close = true;
+                        }
                     });
                 }
                 DialogState::ConfirmDelete {
@@ -2357,19 +3147,21 @@ impl TabManagerApp {
                     targets,
                     permanent,
                 } => {
-                    ui.label(format!("{} Element(e) löschen?", targets.len()));
+                    ui.label(
+                        RichText::new(format!("{} Element(e) löschen?", targets.len()))
+                            .size(14.5)
+                            .color(p.text_primary),
+                    );
+                    ui.add_space(6.0);
                     ui.checkbox(permanent, "Endgültig löschen (Papierkorb überspringen)");
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Abbrechen").clicked() {
-                            close = true;
-                        }
-                        let btn_text = if *permanent {
-                            RichText::new("Endgültig löschen").color(p.danger).strong()
+                    ui.add_space(16.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let lbl = if *permanent {
+                            "Endgültig löschen"
                         } else {
-                            RichText::new("In Papierkorb").strong()
+                            "In Papierkorb"
                         };
-                        if ui.button(btn_text).clicked() {
+                        if pill_button(ui, Icon::Trash, lbl, p.danger, p.danger, Color32::WHITE, None).clicked() {
                             let pane_i = *pane;
                             let t = targets.clone();
                             let perm = *permanent;
@@ -2379,19 +3171,16 @@ impl TabManagerApp {
                                 app.start_delete(t, perm);
                             }));
                         }
+                        if ui.button("Abbrechen").clicked() {
+                            close = true;
+                        }
                     });
                 }
                 DialogState::ConfirmEmptyTrash => {
                     ui.label("Alle Elemente im Papierkorb unwiderruflich löschen?");
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Abbrechen").clicked() {
-                            close = true;
-                        }
-                        if ui
-                            .button(RichText::new("Leeren").color(p.danger).strong())
-                            .clicked()
-                        {
+                    ui.add_space(16.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if pill_button(ui, Icon::Trash, "Leeren", p.danger, p.danger, Color32::WHITE, None).clicked() {
                             close = true;
                             action = Some(Box::new(|app| match trash::empty_trash(&app.primary_root) {
                                 Ok(_) => {
@@ -2400,6 +3189,9 @@ impl TabManagerApp {
                                 }
                                 Err(e) => app.show_toast(e, true),
                             }));
+                        }
+                        if ui.button("Abbrechen").clicked() {
+                            close = true;
                         }
                     });
                 }
@@ -2430,7 +3222,7 @@ impl TabManagerApp {
                     .unwrap_or_else(|| "Vorschau".to_string()),
             };
 
-            let max_size = ctx.content_rect().size() * 0.85;
+            let max_size = ctx.content_rect().size() * 0.84;
             egui::Window::new(title)
                 .collapsible(false)
                 .resizable(true)
@@ -2444,25 +3236,22 @@ impl TabManagerApp {
                         dirty,
                     } => {
                         ui.horizontal(|ui| {
-                            if !*truncated
-                                && ui
-                                    .add_enabled(*dirty, egui::Button::new("💾 Speichern"))
-                                    .clicked()
-                            {
-                                save_text = Some((path.clone(), content.clone()));
-                                *dirty = false;
+                            if !*truncated && *dirty {
+                                if pill_button(ui, Icon::Save, "Speichern", p.accent, p.accent_hover, Color32::WHITE, None).clicked() {
+                                    save_text = Some((path.clone(), content.clone()));
+                                    *dirty = false;
+                                }
                             }
-                            if ui.button("↗ Mit anderer App öffnen").clicked() {
+                            if pill_button(ui, Icon::ExternalOpen, "Externe App", p.bg_surface, p.bg_hover, p.text_primary, None).clicked() {
                                 open_external = Some(path.clone());
                             }
                             if *truncated {
                                 ui.label(
-                                    RichText::new("Nur Vorschau (Datei > 512 KB)")
-                                        .color(p.warning),
+                                    RichText::new("Nur Vorschau (Datei > 512 KB)").color(p.warning),
                                 );
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("Schließen").clicked() {
+                                if icon_button(ui, Icon::Close, false, true, p.bg_hover, p.accent_soft, p.text_secondary, p.text_primary).clicked() {
                                     close = true;
                                 }
                             });
@@ -2489,23 +3278,23 @@ impl TabManagerApp {
                     } => {
                         ui.horizontal(|ui| {
                             if let Some((w, h)) = dimensions {
-                                ui.label(format!("{w} × {h} px"));
+                                ui.label(RichText::new(format!("{w} × {h} px")).color(p.text_secondary));
                             }
-                            if ui.button("−").clicked() {
+                            if icon_button(ui, Icon::ZoomOut, false, true, p.bg_hover, p.accent_soft, p.text_primary, p.accent).clicked() {
                                 *zoom = (*zoom * 0.8).clamp(0.2, 5.0);
                             }
                             ui.label(format!("{:.0}%", *zoom * 100.0));
-                            if ui.button("+").clicked() {
+                            if icon_button(ui, Icon::ZoomIn, false, true, p.bg_hover, p.accent_soft, p.text_primary, p.accent).clicked() {
                                 *zoom = (*zoom * 1.25).clamp(0.2, 5.0);
                             }
                             if ui.button("100%").clicked() {
                                 *zoom = 1.0;
                             }
-                            if ui.button("↗ Externe App").clicked() {
+                            if pill_button(ui, Icon::ExternalOpen, "Externe App", p.bg_surface, p.bg_hover, p.text_primary, None).clicked() {
                                 open_external = Some(path.clone());
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("Schließen").clicked() {
+                                if icon_button(ui, Icon::Close, false, true, p.bg_hover, p.accent_soft, p.text_secondary, p.text_primary).clicked() {
                                     close = true;
                                 }
                             });
@@ -2529,17 +3318,20 @@ impl TabManagerApp {
                         error,
                     } => {
                         ui.horizontal(|ui| {
-                            ui.label(format!("{} Einträge im ZIP-Archiv", entries.len()));
-                            if ui.button("📂 In Ordner entpacken").clicked() {
+                            ui.label(
+                                RichText::new(format!("{} Einträge", entries.len()))
+                                    .color(p.text_secondary),
+                            );
+                            if pill_button(ui, Icon::Unzip, "In Ordner entpacken", p.accent, p.accent_hover, Color32::WHITE, None).clicked() {
                                 extract_zip_req = Some((path.clone(), true));
                                 close = true;
                             }
-                            if ui.button("📂 Hier entpacken").clicked() {
+                            if pill_button(ui, Icon::Unzip, "Hier entpacken", p.bg_surface, p.bg_hover, p.text_primary, None).clicked() {
                                 extract_zip_req = Some((path.clone(), false));
                                 close = true;
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("Schließen").clicked() {
+                                if icon_button(ui, Icon::Close, false, true, p.bg_hover, p.accent_soft, p.text_secondary, p.text_primary).clicked() {
                                     close = true;
                                 }
                             });
@@ -2551,7 +3343,16 @@ impl TabManagerApp {
                             ScrollArea::vertical().show(ui, |ui| {
                                 for e in entries.iter() {
                                     ui.horizontal(|ui| {
-                                        ui.label(if e.is_dir { "📁" } else { "📄" });
+                                        icon_widget(
+                                            ui,
+                                            if e.is_dir { Icon::Folder } else { Icon::File },
+                                            16.0,
+                                            if e.is_dir {
+                                                Palette::category_color(FileCategory::Folder)
+                                            } else {
+                                                p.text_secondary
+                                            },
+                                        );
                                         ui.label(&e.name);
                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                             if !e.is_dir {
@@ -2617,16 +3418,12 @@ impl TabManagerApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .min_width(360.0)
+            .min_width(380.0)
             .show(ctx, |ui| {
                 ui.label(RichText::new(&snap.current_item).color(p.text_secondary));
-                ui.add_space(8.0);
-                ui.add(
-                    egui::ProgressBar::new(snap.fraction())
-                        .show_percentage()
-                        .fill(p.accent),
-                );
-                ui.add_space(6.0);
+                ui.add_space(10.0);
+                self.draw_slim_bar(ui, snap.fraction(), p.accent, p.bg_hover, 8.0);
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!("{} / {}", snap.completed, snap.total))
@@ -2634,7 +3431,10 @@ impl TabManagerApp {
                             .color(p.text_muted),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button(RichText::new("Abbrechen").color(p.danger)).clicked() {
+                        if ui
+                            .button(RichText::new("Abbrechen").color(p.danger))
+                            .clicked()
+                        {
                             job.cancel();
                         }
                     });
@@ -2642,27 +3442,49 @@ impl TabManagerApp {
             });
     }
 
-    fn draw_toast(&self, ctx: &egui::Context, p: &Palette) {
+    fn draw_toast(&self, ctx: &egui::Context, p: &Palette, bot_pad: f32) {
         let Some(toast) = &self.toast else {
             return;
         };
         egui::Area::new(egui::Id::NULL.with("toast_overlay"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-20.0, -20.0))
+            .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-22.0, -(22.0 + bot_pad)))
             .show(ctx, |ui| {
                 Frame::NONE
-                    .fill(if toast.is_error { p.danger } else { p.bg_card_hover })
-                    .corner_radius(CornerRadius::same(10))
-                    .stroke(Stroke::new(1.0, if toast.is_error { p.danger } else { p.accent }))
+                    .fill(if toast.is_error { p.danger } else { p.bg_floating })
+                    .corner_radius(CornerRadius::same(12))
+                    .stroke(Stroke::new(
+                        1.0,
+                        if toast.is_error { p.danger } else { p.accent },
+                    ))
+                    .shadow(Shadow {
+                        offset: [0, 6],
+                        blur: 18,
+                        spread: 0,
+                        color: Color32::from_black_alpha(100),
+                    })
                     .inner_margin(Margin::symmetric(16, 10))
                     .show(ui, |ui| {
                         ui.label(
                             RichText::new(&toast.message)
+                                .size(13.5)
                                 .strong()
                                 .color(Color32::WHITE),
                         );
                     });
             });
     }
+}
+
+fn truncate_middle(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    let keep_front = (max_chars.saturating_sub(1)) * 2 / 3;
+    let keep_back = max_chars.saturating_sub(keep_front + 1);
+    let front: String = s.chars().take(keep_front).collect();
+    let back: String = s.chars().skip(count - keep_back).collect();
+    format!("{front}…{back}")
 }
 
 impl eframe::App for TabManagerApp {

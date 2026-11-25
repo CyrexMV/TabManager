@@ -25,7 +25,7 @@ impl Default for AppPrefs {
             sort_order: SortOrder::Ascending,
             show_hidden: false,
             folders_first: true,
-            dual_pane: true, // Galaxy Tab S12 Ultra 14.6" shines with Dual-Pane!
+            dual_pane: false,
             show_inspector: false,
             favorites: Vec::new(),
         }

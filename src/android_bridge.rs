@@ -268,6 +268,43 @@ impl PlatformBridge {
         }
     }
 
+    pub fn system_insets_px(&self) -> (f32, f32, f32, f32) {
+        #[cfg(target_os = "android")]
+        {
+            if let Some(inner) = &self.inner {
+                if let Ok(mut env) = inner.vm.attach_current_thread() {
+                    if let Ok(val) = env.call_method(
+                        inner.activity.as_obj(),
+                        "getSystemInsetsEncoded",
+                        "()Ljava/lang/String;",
+                        &[],
+                    ) {
+                        if let Ok(obj) = val.l() {
+                            if !obj.is_null() {
+                                let jstr = jni::objects::JString::from(obj);
+                                if let Ok(s) = env.get_string(&jstr) {
+                                    let encoded: String = s.into();
+                                    let parts: Vec<f32> = encoded
+                                        .split(',')
+                                        .filter_map(|p| p.trim().parse::<f32>().ok())
+                                        .collect();
+                                    if parts.len() == 4 {
+                                        return (parts[0], parts[1], parts[2], parts[3]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            (0.0, 0.0, 0.0, 0.0)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            (0.0, 0.0, 0.0, 0.0)
+        }
+    }
+
     pub fn primary_storage_root(&self) -> PathBuf {
         self.get_storage_roots()
             .into_iter()
