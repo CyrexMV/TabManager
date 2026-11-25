@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Folder tab -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M26,34C26,30.7 28.7,28 32,28H46L52,35H76C79.3,35 82,37.7 82,41V46H26V34Z" />
+    <!-- Folder body -->
+    <path
+        android:fillColor="#6366F1"
+        android:pathData="M24,43C24,39.7 26.7,37 30,37H78C81.3,37 84,39.7 84,43V73C84,76.3 81.3,79 78,79H30C26.7,79 24,76.3 24,73V43Z" />
+    <!-- Dual-pane accent cards -->
+    <path
+        android:fillColor="#E0E7FF"
+        android:pathData="M34,49H51V69H34Z" />
+    <path
+        android:fillColor="#BAE6FD"
+        android:pathData="M57,49H74V69H57Z" />
+</vector>

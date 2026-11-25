@@ -1,0 +1,44 @@
+[package]
+name = "tabmanager"
+version = "1.0.0"
+edition = "2024"
+description = "High-End Rust File Manager for Galaxy Tab S12 Ultra (eframe + egui + wgpu)"
+license = "MIT"
+
+[lib]
+name = "tabmanager"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "tabmanager-desktop"
+path = "src/main.rs"
+
+[dependencies]
+egui = { version = "0.37", features = ["default_fonts"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu", "persistence"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+walkdir = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+log = "0.4"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu", "persistence", "wayland", "x11"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu", "persistence", "android-native-activity"] }
+winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
+android_logger = { version = "0.15", default-features = false }
+jni = "0.21"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
