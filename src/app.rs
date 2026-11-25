@@ -921,18 +921,45 @@ impl TabManagerApp {
             )
             .show(ui, |ui| {
                 if dual {
-                    let avail = ui.available_size();
+                    let full_rect = ui.available_rect_before_wrap();
                     let gap = 12.0;
-                    let half_w = ((avail.x - gap) * 0.5).max(200.0);
-                    ui.horizontal(|ui| {
-                        ui.allocate_ui(Vec2::new(half_w, avail.y), |ui| {
+                    let half_w = ((full_rect.width() - gap) * 0.5).max(160.0);
+                    let left_rect =
+                        Rect::from_min_size(full_rect.min, vec2(half_w, full_rect.height()));
+                    let right_rect = Rect::from_min_size(
+                        egui::pos2(left_rect.right() + gap, full_rect.top()),
+                        vec2((full_rect.width() - half_w - gap).max(160.0), full_rect.height()),
+                    );
+
+                    // Activate whichever pane is tapped
+                    if ui.input(|i| i.pointer.any_pressed()) {
+                        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                            if left_rect.contains(pos) {
+                                self.active_pane = 0;
+                            } else if right_rect.contains(pos) {
+                                self.active_pane = 1;
+                            }
+                        }
+                    }
+
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(left_rect)
+                            .layout(Layout::top_down(Align::LEFT)),
+                        |ui| {
+                            ui.set_clip_rect(left_rect);
                             self.draw_pane(ui, &ctx, 0, &p, true);
-                        });
-                        ui.add_space(gap);
-                        ui.allocate_ui(Vec2::new(half_w, avail.y), |ui| {
+                        },
+                    );
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(right_rect)
+                            .layout(Layout::top_down(Align::LEFT)),
+                        |ui| {
+                            ui.set_clip_rect(right_rect);
                             self.draw_pane(ui, &ctx, 1, &p, true);
-                        });
-                    });
+                        },
+                    );
                 } else {
                     self.draw_pane(ui, &ctx, 0, &p, false);
                 }
@@ -1598,9 +1625,61 @@ impl TabManagerApp {
             .fill(p.bg_surface_alt)
             .corner_radius(CornerRadius::same(16))
             .stroke(stroke)
-            .inner_margin(Margin::same(14))
+            .inner_margin(Margin::same(if is_dual { 10 } else { 14 }))
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
+                ui.set_max_width(ui.available_width());
+
+                // 0. Per-Pane Header Bar in Split-View (Active badge + independent nav!)
+                if is_dual {
+                    let can_back = !self.panes[pane_idx].current_tab().history_back.is_empty();
+                    let can_up = self.panes[pane_idx]
+                        .current_dir()
+                        .and_then(|d| d.parent())
+                        .is_some();
+                    ui.horizontal(|ui| {
+                        let badge_label = if pane_idx == 0 { "Links" } else { "Rechts" };
+                        let badge_bg = if is_active { p.accent } else { p.bg_surface };
+                        let badge_fg = if is_active { Color32::WHITE } else { p.text_secondary };
+                        let b = Frame::NONE
+                            .fill(badge_bg)
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::symmetric(10, 4))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(badge_label)
+                                        .size(12.0)
+                                        .strong()
+                                        .color(badge_fg),
+                                );
+                            })
+                            .response
+                            .interact(Sense::click());
+                        if b.clicked() {
+                            self.active_pane = pane_idx;
+                        }
+
+                        if icon_button(ui, Icon::Back, false, can_back, p.bg_hover, p.accent_soft, p.text_primary, p.accent).clicked() {
+                            self.go_back(pane_idx);
+                        }
+                        if icon_button(ui, Icon::Up, false, can_up, p.bg_hover, p.accent_soft, p.text_primary, p.accent).clicked() {
+                            self.go_up(pane_idx);
+                        }
+                        if icon_button(ui, Icon::Home, false, true, p.bg_hover, p.accent_soft, p.text_secondary, p.accent).clicked() {
+                            self.navigate(pane_idx, Location::Special(SpecialView::Home));
+                        }
+                        if icon_button(ui, Icon::Storage, false, true, p.bg_hover, p.accent_soft, p.text_secondary, p.accent).clicked() {
+                            let root = self.primary_root.clone();
+                            self.navigate(pane_idx, Location::Dir(root));
+                        }
+                    });
+                    ui.add_space(4.0);
+                    let (div_r, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                    ui.painter()
+                        .rect_filled(div_r, CornerRadius::ZERO, p.divider);
+                    ui.add_space(6.0);
+                }
 
                 // 1. Tab Strip (only prominent when >1 tab, plus subtle + tab button in breadcrumb)
                 if self.panes[pane_idx].tabs.len() > 1 {
@@ -1610,7 +1689,7 @@ impl TabManagerApp {
 
                 // 2. Clean Breadcrumb Header
                 self.draw_breadcrumb_bar(ui, pane_idx, p);
-                ui.add_space(10.0);
+                ui.add_space(8.0);
 
                 // 3. Content
                 let loc = self.panes[pane_idx].current_location().clone();
@@ -2364,38 +2443,55 @@ impl TabManagerApp {
 
                                     ui.add_space(6.0);
 
-                                    // Filename
-                                    ui.vertical(|ui| {
-                                        ui.label(
-                                            RichText::new(&entry.name)
-                                                .size(14.5)
-                                                .strong()
-                                                .color(p.text_primary),
-                                        );
-                                        if !show_cols {
-                                            let sub = if entry.is_dir {
-                                                format!("{} Elemente", entry.child_count.unwrap_or(0))
-                                            } else {
-                                                format!(
-                                                    "{}  •  {}",
-                                                    format_size(entry.size),
-                                                    format_timestamp(entry.modified_secs)
+                                    // Filename (cleanly truncated so long names never overflow Split-View!)
+                                    let right_reserved = if show_cols { 265.0 } else { 48.0 };
+                                    let max_name_w = (ui.available_width() - right_reserved).max(80.0);
+                                    ui.allocate_ui_with_layout(
+                                        vec2(max_name_w, 40.0),
+                                        Layout::top_down(Align::LEFT),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&entry.name)
+                                                        .size(14.5)
+                                                        .strong()
+                                                        .color(p.text_primary),
                                                 )
-                                            };
-                                            ui.label(
-                                                RichText::new(sub).size(11.5).color(p.text_muted),
+                                                .truncate(),
                                             );
-                                        } else if entry.is_dir {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{} Elemente",
-                                                    entry.child_count.unwrap_or(0)
-                                                ))
-                                                .size(11.5)
-                                                .color(p.text_muted),
-                                            );
-                                        }
-                                    });
+                                            if !show_cols {
+                                                let sub = if entry.is_dir {
+                                                    format!(
+                                                        "{} Elemente",
+                                                        entry.child_count.unwrap_or(0)
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "{}  •  {}",
+                                                        format_size(entry.size),
+                                                        format_timestamp(entry.modified_secs)
+                                                    )
+                                                };
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(sub)
+                                                            .size(11.5)
+                                                            .color(p.text_muted),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            } else if entry.is_dir {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{} Elemente",
+                                                        entry.child_count.unwrap_or(0)
+                                                    ))
+                                                    .size(11.5)
+                                                    .color(p.text_muted),
+                                                );
+                                            }
+                                        },
+                                    );
 
                                     // 3. Right-aligned columns + Action Sheet trigger button
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
