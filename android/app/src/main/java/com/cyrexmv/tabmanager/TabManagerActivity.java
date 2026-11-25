@@ -4,6 +4,7 @@ import android.app.NativeActivity;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -13,11 +14,21 @@ import android.os.storage.StorageVolume;
 import android.provider.Settings;
 import android.system.ErrnoException;
 import android.system.Os;
+import android.text.Editable;
+import android.text.InputType;
+import android.text.TextWatcher;
 import android.view.Display;
+import android.view.KeyEvent;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.webkit.MimeTypeMap;
+import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.window.OnBackInvokedDispatcher;
 
 import androidx.core.content.FileProvider;
@@ -26,24 +37,33 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Thin NativeActivity wrapper around libtabmanager.so (100% Rust UI & file engine).
- * Provides only Android OS bridges that NativeActivity cannot perform directly in Rust:
+ * Provides Android OS bridges:
  * - 120 Hz display mode on Galaxy Tab S12 Ultra
+ * - System bar / cutout WindowInsets
+ * - Reliable Back button & Back gesture forwarding
+ * - Real Android IME / Soft Keyboard bridge via hidden EditText (supports umlauts, swipe, Backspace, Enter)
  * - All Files Access (MANAGE_EXTERNAL_STORAGE) check & settings intent
  * - FileProvider ACTION_VIEW / ACTION_SEND intents
- * - Back gesture forwarding & soft keyboard control
  * - Storage volume discovery (Internal + SD / USB OTG)
  */
 public class TabManagerActivity extends NativeActivity {
 
     private final AtomicBoolean backPressed = new AtomicBoolean(false);
+    private final ConcurrentLinkedQueue<String> imeQueue = new ConcurrentLinkedQueue<>();
+
     private volatile int insetTop = 0;
     private volatile int insetBottom = 0;
     private volatile int insetLeft = 0;
     private volatile int insetRight = 0;
+
+    private EditText imeBridge;
+    private boolean resettingIme = false;
+    private static final String SENTINEL = "\u200B"; // Zero-width space to detect Backspace even when empty
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -54,13 +74,14 @@ public class TabManagerActivity extends NativeActivity {
         super.onCreate(savedInstanceState);
 
         requestHighRefreshRate();
+        setupImeBridge();
 
         if (Build.VERSION.SDK_INT >= 30) {
             getWindow().getDecorView().setOnApplyWindowInsetsListener((v, insets) -> {
                 android.graphics.Insets bars = insets.getInsets(
-                        android.view.WindowInsets.Type.systemBars()
-                                | android.view.WindowInsets.Type.displayCutout()
-                                | android.view.WindowInsets.Type.captionBar()
+                        WindowInsets.Type.systemBars()
+                                | WindowInsets.Type.displayCutout()
+                                | WindowInsets.Type.captionBar()
                 );
                 insetTop = bars.top;
                 insetBottom = bars.bottom;
@@ -73,14 +94,112 @@ public class TabManagerActivity extends NativeActivity {
 
         if (Build.VERSION.SDK_INT >= 33) {
             getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
-                    OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                    OnBackInvokedDispatcher.PRIORITY_OVERLAY,
                     () -> backPressed.set(true)
             );
         }
     }
 
-    public String getSystemInsetsEncoded() {
-        return insetTop + "," + insetBottom + "," + insetLeft + "," + insetRight;
+    private void setupImeBridge() {
+        imeBridge = new EditText(this);
+        imeBridge.setBackgroundColor(Color.TRANSPARENT);
+        imeBridge.setTextColor(Color.TRANSPARENT);
+        imeBridge.setCursorVisible(false);
+        imeBridge.setSingleLine(true);
+        imeBridge.setImeOptions(EditorInfo.IME_ACTION_DONE | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+        imeBridge.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        imeBridge.setAlpha(0.0f);
+        imeBridge.setFocusable(true);
+        imeBridge.setFocusableInTouchMode(true);
+
+        resetImeSentinel();
+
+        imeBridge.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {}
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                if (resettingIme) return;
+                String current = s.toString();
+                if (current.isEmpty()) {
+                    // User deleted the sentinel -> Backspace!
+                    imeQueue.add("BS");
+                    resetImeSentinel();
+                    return;
+                }
+                String cleaned = current.replace(SENTINEL, "");
+                if (!cleaned.isEmpty()) {
+                    for (int i = 0; i < cleaned.length(); ) {
+                        int cp = cleaned.codePointAt(i);
+                        i += Character.charCount(cp);
+                        if (cp == '\n' || cp == '\r') {
+                            imeQueue.add("ENTER");
+                        } else {
+                            imeQueue.add("TXT:" + new String(Character.toChars(cp)));
+                        }
+                    }
+                    resetImeSentinel();
+                }
+            }
+        });
+
+        imeBridge.setOnEditorActionListener((v, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_DONE
+                    || actionId == EditorInfo.IME_ACTION_GO
+                    || actionId == EditorInfo.IME_ACTION_SEARCH
+                    || actionId == EditorInfo.IME_ACTION_SEND
+                    || (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER
+                    && event.getAction() == KeyEvent.ACTION_DOWN)) {
+                imeQueue.add("ENTER");
+                return true;
+            }
+            return false;
+        });
+
+        imeBridge.setOnKeyListener((v, keyCode, event) -> {
+            if (keyCode == KeyEvent.KEYCODE_BACK) {
+                if (event.getAction() == KeyEvent.ACTION_UP) {
+                    backPressed.set(true);
+                }
+                return true;
+            }
+            if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                if (keyCode == KeyEvent.KEYCODE_DEL) {
+                    imeQueue.add("BS");
+                    return true;
+                }
+                if (keyCode == KeyEvent.KEYCODE_ENTER || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER) {
+                    imeQueue.add("ENTER");
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(1, 1);
+        addContentView(imeBridge, lp);
+    }
+
+    private void resetImeSentinel() {
+        resettingIme = true;
+        imeBridge.setText(SENTINEL);
+        imeBridge.setSelection(SENTINEL.length());
+        resettingIme = false;
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
+            if (event.getAction() == KeyEvent.ACTION_UP) {
+                backPressed.set(true);
+            }
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
     }
 
     @Override
@@ -112,8 +231,22 @@ public class TabManagerActivity extends NativeActivity {
 
     // ---- JNI-called methods from Rust (src/android_bridge.rs) ----
 
+    public String getSystemInsetsEncoded() {
+        return insetTop + "," + insetBottom + "," + insetLeft + "," + insetRight;
+    }
+
     public boolean takeBackPressed() {
         return backPressed.getAndSet(false);
+    }
+
+    public String takeImeEventsEncoded() {
+        StringBuilder sb = new StringBuilder();
+        String ev;
+        while ((ev = imeQueue.poll()) != null) {
+            if (sb.length() > 0) sb.append('\n');
+            sb.append(ev);
+        }
+        return sb.toString();
     }
 
     public void moveToBackground() {
@@ -199,28 +332,41 @@ public class TabManagerActivity extends NativeActivity {
 
     public void showSoftKeyboard() {
         runOnUiThread(() -> {
-            View view = getWindow().getDecorView();
-            view.requestFocus();
-            InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
-            if (imm != null) {
-                imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT);
-            }
+            if (imeBridge == null) return;
+            resetImeSentinel();
+            imeBridge.requestFocus();
+            imeBridge.postDelayed(() -> {
+                InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                if (imm != null) {
+                    imm.showSoftInput(imeBridge, InputMethodManager.SHOW_IMPLICIT);
+                }
+                if (Build.VERSION.SDK_INT >= 30) {
+                    WindowInsetsController ctrl = getWindow().getInsetsController();
+                    if (ctrl != null) {
+                        ctrl.show(WindowInsets.Type.ime());
+                    }
+                }
+            }, 40);
         });
     }
 
     public void hideSoftKeyboard() {
         runOnUiThread(() -> {
-            View view = getWindow().getDecorView();
+            if (imeBridge == null) return;
             InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
             if (imm != null) {
-                imm.hideSoftInputFromWindow(view.getWindowToken(), 0);
+                imm.hideSoftInputFromWindow(imeBridge.getWindowToken(), 0);
             }
+            if (Build.VERSION.SDK_INT >= 30) {
+                WindowInsetsController ctrl = getWindow().getInsetsController();
+                if (ctrl != null) {
+                    ctrl.hide(WindowInsets.Type.ime());
+                }
+            }
+            imeBridge.clearFocus();
         });
     }
 
-    /**
-     * Returns newline-separated entries formatted as: name|path|removable(0/1)
-     */
     public String getStorageRootsEncoded() {
         StringBuilder sb = new StringBuilder();
         Set<String> seen = new HashSet<>();

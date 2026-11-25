@@ -1,5 +1,12 @@
 use std::path::PathBuf;
 
+#[derive(Debug, Clone)]
+pub enum ImeEvent {
+    Text(String),
+    Backspace,
+    Enter,
+}
+
 /// Platform bridge: on Android uses JNI calls into `TabManagerActivity` (a thin `NativeActivity`
 /// subclass); on desktop provides sensible Linux/OS fallbacks so the app compiles and runs everywhere.
 #[derive(Clone, Default)]
@@ -187,6 +194,46 @@ impl PlatformBridge {
         #[cfg(not(target_os = "android"))]
         {
             false
+        }
+    }
+
+    pub fn take_ime_events(&self) -> Vec<ImeEvent> {
+        #[cfg(target_os = "android")]
+        {
+            let mut out = Vec::new();
+            if let Some(inner) = &self.inner {
+                if let Ok(mut env) = inner.vm.attach_current_thread() {
+                    if let Ok(val) = env.call_method(
+                        inner.activity.as_obj(),
+                        "takeImeEventsEncoded",
+                        "()Ljava/lang/String;",
+                        &[],
+                    ) {
+                        if let Ok(obj) = val.l() {
+                            if !obj.is_null() {
+                                let jstr = jni::objects::JString::from(obj);
+                                if let Ok(s) = env.get_string(&jstr) {
+                                    let encoded: String = s.into();
+                                    for line in encoded.lines() {
+                                        if line == "BS" {
+                                            out.push(ImeEvent::Backspace);
+                                        } else if line == "ENTER" {
+                                            out.push(ImeEvent::Enter);
+                                        } else if let Some(txt) = line.strip_prefix("TXT:") {
+                                            out.push(ImeEvent::Text(txt.to_string()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Vec::new()
         }
     }
 

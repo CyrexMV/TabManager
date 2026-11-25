@@ -1,4 +1,4 @@
-use crate::android_bridge::PlatformBridge;
+use crate::android_bridge::{ImeEvent, PlatformBridge};
 use crate::fs_ops;
 use crate::icons::{category_icon_badge, icon_button, icon_widget, paint_icon, pill_button, Icon};
 use crate::model::{
@@ -49,6 +49,16 @@ enum DialogState {
         permanent: bool,
     },
     ConfirmEmptyTrash,
+    ContextSheet {
+        pane: usize,
+        entry: FileEntry,
+    },
+    PickFolder {
+        pane: usize,
+        sources: Vec<PathBuf>,
+        is_move: bool,
+        browse_dir: PathBuf,
+    },
 }
 
 enum ViewerState {
@@ -94,6 +104,14 @@ struct DecodedThumb {
     image: egui::ColorImage,
 }
 
+struct LongPressTracker {
+    pane: usize,
+    entry: FileEntry,
+    started_at: Instant,
+    start_pos: egui::Pos2,
+    fired: bool,
+}
+
 pub struct TabManagerApp {
     bridge: PlatformBridge,
     config_dir: PathBuf,
@@ -129,6 +147,7 @@ pub struct TabManagerApp {
     thumb_tx: Sender<DecodedThumb>,
     thumb_rx: Receiver<DecodedThumb>,
 
+    long_press: Option<LongPressTracker>,
     sidebar_open: bool,
     keyboard_was_open: bool,
 }
@@ -176,6 +195,7 @@ impl TabManagerApp {
             thumbs_requested: HashSet::new(),
             thumb_tx,
             thumb_rx,
+            long_press: None,
             sidebar_open: true,
             keyboard_was_open: false,
         };
@@ -636,20 +656,17 @@ impl TabManagerApp {
             }
         }
 
-        if self.bridge.take_back_pressed() {
-            if self.dialog.is_some() {
-                self.dialog = None;
-            } else if self.viewer.is_some() {
-                self.viewer = None;
-            } else if !self.panes[self.active_pane].selected.is_empty() {
-                self.panes[self.active_pane].selected.clear();
-            } else if !self.panes[self.active_pane].current_tab().history_back.is_empty() {
-                self.go_back(self.active_pane);
-            } else {
-                self.bridge.move_to_background();
-            }
+        let back_key_pressed = ctx.input(|i| {
+            i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::BrowserBack)
+        });
+        if self.bridge.take_back_pressed() || back_key_pressed {
+            self.handle_back();
             ctx.request_repaint();
         }
+
+        // Gentle periodic poll on Android so Back button & IME events respond immediately even when idle
+        #[cfg(target_os = "android")]
+        ctx.request_repaint_after(Duration::from_millis(90));
 
         if let Some(job) = &self.bg_job {
             let snap = job.snapshot();
@@ -701,6 +718,41 @@ impl TabManagerApp {
         } else if !wants_kb && self.keyboard_was_open {
             self.bridge.hide_keyboard();
             self.keyboard_was_open = false;
+        }
+    }
+
+    fn handle_back(&mut self) {
+        let ap = self.active_pane;
+        if self.dialog.is_some() {
+            self.dialog = None;
+        } else if self.viewer.is_some() {
+            self.viewer = None;
+        } else if !self.search_query.is_empty() {
+            self.search_query.clear();
+            if self.search_recursive_mode {
+                self.search_recursive_mode = false;
+                self.refresh_pane(ap);
+            }
+        } else if !self.panes[ap].selected.is_empty() {
+            self.panes[ap].selected.clear();
+        } else if !self.panes[ap].current_tab().history_back.is_empty() {
+            self.go_back(ap);
+        } else if let Some(dir) = self.panes[ap].current_dir().map(Path::to_path_buf) {
+            if dir != self.primary_root
+                && dir.starts_with(&self.primary_root)
+                && dir.parent().is_some()
+            {
+                self.go_up(ap);
+            } else {
+                self.navigate(ap, Location::Special(SpecialView::Home));
+            }
+        } else if !matches!(
+            self.panes[ap].current_location(),
+            Location::Special(SpecialView::Home)
+        ) {
+            self.navigate(ap, Location::Special(SpecialView::Home));
+        } else {
+            self.bridge.move_to_background();
         }
     }
 
@@ -773,7 +825,27 @@ impl TabManagerApp {
                 });
         }
 
-        // 3. Persistent Clipboard Bar (when files are copied/cut)
+        // 3. Docked Full-Width Selection Action Bar (whenever 1+ items are selected!)
+        let active_sel_count = self.panes[self.active_pane].selected.len();
+        if active_sel_count > 0 {
+            egui::Panel::bottom("selection_action_bar")
+                .frame(
+                    Frame::NONE
+                        .fill(p.bg_floating)
+                        .inner_margin(Margin {
+                            left: 16 + left_pad,
+                            right: 16 + right_pad,
+                            top: 10,
+                            bottom: 10 + bot_pad,
+                        })
+                        .stroke(Stroke::new(1.5, p.accent)),
+                )
+                .show(ui, |ui| {
+                    self.draw_selection_action_bar(ui, self.active_pane, &p, dual);
+                });
+        }
+
+        // 4. Persistent Clipboard Bar (when files are copied/cut)
         if !self.clipboard.is_empty() {
             egui::Panel::bottom("clipboard_bar")
                 .frame(
@@ -783,7 +855,7 @@ impl TabManagerApp {
                             left: 18 + left_pad,
                             right: 18 + right_pad,
                             top: 10,
-                            bottom: 10 + bot_pad,
+                            bottom: 10 + if active_sel_count > 0 { 0 } else { bot_pad },
                         })
                         .stroke(Stroke::new(1.0, p.accent)),
                 )
@@ -792,7 +864,7 @@ impl TabManagerApp {
                 });
         }
 
-        // 4. Sleek Finder / One UI Sidebar
+        // 5. Sleek Finder / One UI Sidebar
         if self.sidebar_open {
             egui::Panel::left("sidebar")
                 .resizable(true)
@@ -814,7 +886,7 @@ impl TabManagerApp {
                 });
         }
 
-        // 5. Optional Right Inspector Panel
+        // 6. Optional Right Inspector Panel
         if self.prefs.show_inspector && is_wide_tablet {
             egui::Panel::right("inspector")
                 .resizable(true)
@@ -836,7 +908,7 @@ impl TabManagerApp {
                 });
         }
 
-        // 6. Main File Workspace
+        // 7. Main File Workspace
         egui::CentralPanel::default()
             .frame(
                 Frame::NONE
@@ -866,12 +938,6 @@ impl TabManagerApp {
                     self.draw_pane(ui, &ctx, 0, &p, false);
                 }
             });
-
-        // 7. Floating Glass Selection Pill (bottom-center, like One UI / iPadOS Files)
-        let active_sel_count = self.panes[self.active_pane].selected.len();
-        if active_sel_count > 0 {
-            self.draw_floating_selection_bar(&ctx, self.active_pane, &p, dual, bot_pad as f32);
-        }
 
         // 8. Modals, Viewers, Progress & Toasts
         self.draw_dialogs(&ctx, &p);
@@ -2144,7 +2210,31 @@ impl TabManagerApp {
         let mut toggle_select: Option<PathBuf> = None;
         let mut set_active = false;
         let mut context_action: Option<(String, FileEntry)> = None;
+        let mut long_press_open: Option<FileEntry> = None;
         let mut sort_click: Option<SortBy> = None;
+        let pointer_down = ui.input(|i| i.pointer.primary_down());
+        let pointer_pos = ui.input(|i| i.pointer.interact_pos());
+
+        // Clear long-press tracker if finger lifted
+        let mut suppress_click_for_long_press = false;
+        if !pointer_down {
+            if let Some(lp) = self.long_press.take() {
+                if lp.fired {
+                    suppress_click_for_long_press = true;
+                }
+            }
+        } else if let Some(lp) = &mut self.long_press {
+            if let Some(pos) = pointer_pos {
+                if pos.distance(lp.start_pos) > 18.0 {
+                    self.long_press = None;
+                } else if !lp.fired && lp.started_at.elapsed() >= Duration::from_millis(380) {
+                    lp.fired = true;
+                    long_press_open = Some(lp.entry.clone());
+                } else if !lp.fired {
+                    ctx.request_repaint_after(Duration::from_millis(40));
+                }
+            }
+        }
 
         // Clean Table Column Header in List Mode
         if self.prefs.view_mode == ViewMode::List {
@@ -2211,9 +2301,10 @@ impl TabManagerApp {
                         }
                     });
                 });
-            // Subtle hairline divider below table header
-            let (line_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-            ui.painter().rect_filled(line_rect, CornerRadius::ZERO, p.divider);
+            let (line_rect, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+            ui.painter()
+                .rect_filled(line_rect, CornerRadius::ZERO, p.divider);
         }
 
         ScrollArea::vertical()
@@ -2228,27 +2319,33 @@ impl TabManagerApp {
                         } else {
                             Color32::TRANSPARENT
                         };
+                        let mut cb_clicked = false;
+                        let mut menu_interacted = false;
 
                         let resp = Frame::NONE
                             .fill(row_bg)
                             .corner_radius(CornerRadius::same(10))
-                            .inner_margin(Margin::symmetric(10, 7))
+                            .inner_margin(Margin::symmetric(10, 6))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    // Selection circle/checkbox
-                                    let mut checked = is_sel;
-                                    if ui.checkbox(&mut checked, "").changed() {
+                                    // Dedicated left selection square (never conflicts with row tap!)
+                                    if draw_select_box(ui, is_sel, p) {
+                                        cb_clicked = true;
                                         toggle_select = Some(entry.path.clone());
                                         set_active = true;
                                     }
 
                                     // Real image thumbnail OR crisp vector category badge
                                     if let Some(tex) = self.thumbs.get(&entry.path) {
-                                        let (r, _) = ui.allocate_exact_size(vec2(38.0, 38.0), Sense::hover());
+                                        let (r, _) =
+                                            ui.allocate_exact_size(vec2(38.0, 38.0), Sense::hover());
                                         ui.painter().image(
                                             tex.id(),
                                             r,
-                                            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                            Rect::from_min_max(
+                                                egui::pos2(0.0, 0.0),
+                                                egui::pos2(1.0, 1.0),
+                                            ),
                                             Color32::WHITE,
                                         );
                                         ui.painter().rect_stroke(
@@ -2268,7 +2365,7 @@ impl TabManagerApp {
 
                                     ui.add_space(6.0);
 
-                                    // Filename (and compact subtitle on narrow screens)
+                                    // Filename
                                     ui.vertical(|ui| {
                                         ui.label(
                                             RichText::new(&entry.name)
@@ -2286,7 +2383,9 @@ impl TabManagerApp {
                                                     format_timestamp(entry.modified_secs)
                                                 )
                                             };
-                                            ui.label(RichText::new(sub).size(11.5).color(p.text_muted));
+                                            ui.label(
+                                                RichText::new(sub).size(11.5).color(p.text_muted),
+                                            );
                                         } else if entry.is_dir {
                                             ui.label(
                                                 RichText::new(format!(
@@ -2299,16 +2398,23 @@ impl TabManagerApp {
                                         }
                                     });
 
-                                    // Right-aligned columns + overflow menu
+                                    // Right-aligned columns + Action Sheet trigger button
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.menu_button("...", |ui| {
-                                            self.draw_entry_context_menu(
-                                                ui,
-                                                entry,
-                                                p,
-                                                &mut context_action,
-                                            );
-                                        });
+                                        if icon_button(
+                                            ui,
+                                            Icon::MoreVert,
+                                            false,
+                                            true,
+                                            p.bg_hover,
+                                            p.accent_soft,
+                                            p.text_muted,
+                                            p.text_primary,
+                                        )
+                                        .clicked()
+                                        {
+                                            menu_interacted = true;
+                                            long_press_open = Some(entry.clone());
+                                        }
 
                                         if show_cols {
                                             ui.allocate_ui(vec2(125.0, 22.0), |ui| {
@@ -2337,28 +2443,44 @@ impl TabManagerApp {
                                 });
                             })
                             .response
-                            .interact(Sense::click());
+                            .interact(Sense::click_and_drag());
 
-                        if resp.clicked() {
-                            set_active = true;
-                            if !self.panes[pane_idx].selected.is_empty() {
-                                toggle_select = Some(entry.path.clone());
-                            } else {
-                                open_target = Some(entry.clone());
+                        // Start long-press timer when user holds down on a row
+                        if !cb_clicked && !menu_interacted && resp.is_pointer_button_down_on() {
+                            if self.long_press.is_none() {
+                                if let Some(pos) = pointer_pos {
+                                    self.long_press = Some(LongPressTracker {
+                                        pane: pane_idx,
+                                        entry: entry.clone(),
+                                        started_at: Instant::now(),
+                                        start_pos: pos,
+                                        fired: false,
+                                    });
+                                    ctx.request_repaint_after(Duration::from_millis(40));
+                                }
                             }
-                        } else if resp.secondary_clicked() {
-                            set_active = true;
-                            toggle_select = Some(entry.path.clone());
                         }
 
-                        // Subtle row divider
+                        if !cb_clicked && !menu_interacted && !suppress_click_for_long_press {
+                            if resp.clicked() {
+                                set_active = true;
+                                if !self.panes[pane_idx].selected.is_empty() {
+                                    toggle_select = Some(entry.path.clone());
+                                } else {
+                                    open_target = Some(entry.clone());
+                                }
+                            } else if resp.secondary_clicked() {
+                                set_active = true;
+                                long_press_open = Some(entry.clone());
+                            }
+                        }
+
                         let (div_r, _) =
                             ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
                         ui.painter()
                             .rect_filled(div_r, CornerRadius::ZERO, p.divider);
                     }
-                    // Bottom breathing room for floating selection pill
-                    ui.add_space(76.0);
+                    ui.add_space(20.0);
                 }
                 ViewMode::Grid => {
                     let avail_w = ui.available_width();
@@ -2370,6 +2492,9 @@ impl TabManagerApp {
                             for entry in chunk {
                                 let is_sel = self.panes[pane_idx].selected.contains(&entry.path);
                                 let cat_color = Palette::category_color(entry.category);
+                                let mut cb_clicked = false;
+                                let mut menu_interacted = false;
+
                                 let resp = Frame::NONE
                                     .fill(if is_sel { p.bg_selected } else { p.bg_surface })
                                     .corner_radius(CornerRadius::same(16))
@@ -2377,34 +2502,41 @@ impl TabManagerApp {
                                         if is_sel { 1.5 } else { 1.0 },
                                         if is_sel { p.accent } else { p.divider },
                                     ))
-                                    .inner_margin(Margin::same(12))
+                                    .inner_margin(Margin::same(10))
                                     .show(ui, |ui| {
-                                        ui.set_width(tile_w - 24.0);
-                                        ui.set_height(138.0);
+                                        ui.set_width(tile_w - 20.0);
+                                        ui.set_height(142.0);
                                         ui.horizontal(|ui| {
-                                            let mut checked = is_sel;
-                                            if ui.checkbox(&mut checked, "").changed() {
+                                            if draw_select_box(ui, is_sel, p) {
+                                                cb_clicked = true;
                                                 toggle_select = Some(entry.path.clone());
                                                 set_active = true;
                                             }
                                             ui.with_layout(
                                                 Layout::right_to_left(Align::Center),
                                                 |ui| {
-                                                    ui.menu_button("...", |ui| {
-                                                        self.draw_entry_context_menu(
-                                                            ui,
-                                                            entry,
-                                                            p,
-                                                            &mut context_action,
-                                                        );
-                                                    });
+                                                    if icon_button(
+                                                        ui,
+                                                        Icon::MoreVert,
+                                                        false,
+                                                        true,
+                                                        p.bg_hover,
+                                                        p.accent_soft,
+                                                        p.text_muted,
+                                                        p.text_primary,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        menu_interacted = true;
+                                                        long_press_open = Some(entry.clone());
+                                                    }
                                                 },
                                             );
                                         });
                                         ui.vertical_centered(|ui| {
                                             if let Some(tex) = self.thumbs.get(&entry.path) {
                                                 let (r, _) = ui.allocate_exact_size(
-                                                    vec2(58.0, 58.0),
+                                                    vec2(56.0, 56.0),
                                                     Sense::hover(),
                                                 );
                                                 ui.painter().image(
@@ -2420,11 +2552,11 @@ impl TabManagerApp {
                                                 category_icon_badge(
                                                     ui,
                                                     entry.category,
-                                                    54.0,
+                                                    52.0,
                                                     cat_color,
                                                 );
                                             }
-                                            ui.add_space(8.0);
+                                            ui.add_space(6.0);
                                             let short_name = truncate_middle(&entry.name, 18);
                                             ui.label(
                                                 RichText::new(short_name)
@@ -2448,25 +2580,43 @@ impl TabManagerApp {
                                         });
                                     })
                                     .response
-                                    .interact(Sense::click());
+                                    .interact(Sense::click_and_drag());
 
-                                if resp.clicked() {
-                                    set_active = true;
-                                    if !self.panes[pane_idx].selected.is_empty() {
-                                        toggle_select = Some(entry.path.clone());
-                                    } else {
-                                        open_target = Some(entry.clone());
+                                if !cb_clicked && !menu_interacted && resp.is_pointer_button_down_on()
+                                {
+                                    if self.long_press.is_none() {
+                                        if let Some(pos) = pointer_pos {
+                                            self.long_press = Some(LongPressTracker {
+                                                pane: pane_idx,
+                                                entry: entry.clone(),
+                                                started_at: Instant::now(),
+                                                start_pos: pos,
+                                                fired: false,
+                                            });
+                                            ctx.request_repaint_after(Duration::from_millis(40));
+                                        }
                                     }
-                                } else if resp.secondary_clicked() {
-                                    set_active = true;
-                                    toggle_select = Some(entry.path.clone());
+                                }
+
+                                if !cb_clicked && !menu_interacted && !suppress_click_for_long_press {
+                                    if resp.clicked() {
+                                        set_active = true;
+                                        if !self.panes[pane_idx].selected.is_empty() {
+                                            toggle_select = Some(entry.path.clone());
+                                        } else {
+                                            open_target = Some(entry.clone());
+                                        }
+                                    } else if resp.secondary_clicked() {
+                                        set_active = true;
+                                        long_press_open = Some(entry.clone());
+                                    }
                                 }
                                 ui.add_space(4.0);
                             }
                         });
                         ui.add_space(8.0);
                     }
-                    ui.add_space(76.0);
+                    ui.add_space(20.0);
                 }
             });
 
@@ -2481,72 +2631,118 @@ impl TabManagerApp {
                 self.panes[pane_idx].selected.insert(path);
             }
         }
-        if let Some(entry) = open_target {
+        if let Some(entry) = long_press_open {
+            self.active_pane = pane_idx;
+            self.dialog = Some(DialogState::ContextSheet {
+                pane: pane_idx,
+                entry,
+            });
+        } else if let Some(entry) = open_target {
             self.open_entry(pane_idx, &entry, ctx);
         }
         if let Some((action, entry)) = context_action {
-            self.active_pane = pane_idx;
-            match action.as_str() {
-                "open" => self.open_entry(pane_idx, &entry, ctx),
-                "open_ext" => {
-                    if let Err(e) = self.bridge.open_file(&entry.path) {
-                        self.show_toast(e, true);
-                    }
+            self.execute_entry_action(pane_idx, &action, entry, ctx);
+        }
+    }
+
+    fn execute_entry_action(
+        &mut self,
+        pane_idx: usize,
+        action: &str,
+        entry: FileEntry,
+        ctx: &egui::Context,
+    ) {
+        self.active_pane = pane_idx;
+        match action {
+            "open" => self.open_entry(pane_idx, &entry, ctx),
+            "open_ext" => {
+                if let Err(e) = self.bridge.open_file(&entry.path) {
+                    self.show_toast(e, true);
                 }
-                "copy" => {
-                    self.clipboard = ClipboardState {
-                        paths: vec![entry.path],
-                        action: Some(ClipboardAction::Copy),
-                    };
-                    self.show_toast("Zum Kopieren gemerkt", false);
-                }
-                "cut" => {
-                    self.clipboard = ClipboardState {
-                        paths: vec![entry.path],
-                        action: Some(ClipboardAction::Move),
-                    };
-                    self.show_toast("Zum Verschieben gemerkt", false);
-                }
-                "rename" => {
-                    self.dialog = Some(DialogState::Rename {
-                        target: entry.path,
-                        new_name: entry.name,
-                    });
-                }
-                "unzip" => {
-                    let stem = entry
-                        .path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Entpackt".to_string());
-                    self.dialog = Some(DialogState::ExtractZip {
-                        pane: pane_idx,
-                        zip_path: entry.path,
-                        subfolder_name: stem,
-                        extract_into_subfolder: true,
-                    });
-                }
-                "zip" => {
-                    self.dialog = Some(DialogState::CompressZip {
-                        pane: pane_idx,
-                        sources: vec![entry.path],
-                        archive_name: format!("{}.zip", entry.name),
-                    });
-                }
-                "share" => {
-                    if let Err(e) = self.bridge.share_files(&[entry.path]) {
-                        self.show_toast(e, true);
-                    }
-                }
-                "delete" => {
-                    self.dialog = Some(DialogState::ConfirmDelete {
-                        pane: pane_idx,
-                        targets: vec![entry.path],
-                        permanent: false,
-                    });
-                }
-                _ => {}
             }
+            "copy" => {
+                self.clipboard = ClipboardState {
+                    paths: vec![entry.path],
+                    action: Some(ClipboardAction::Copy),
+                };
+                self.show_toast("Zum Kopieren gemerkt — Zielordner öffnen & Einfügen", false);
+            }
+            "cut" => {
+                self.clipboard = ClipboardState {
+                    paths: vec![entry.path],
+                    action: Some(ClipboardAction::Move),
+                };
+                self.show_toast("Zum Verschieben gemerkt — Zielordner öffnen & Einfügen", false);
+            }
+            "move_to" => {
+                let start = self.panes[pane_idx]
+                    .current_dir()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.primary_root.clone());
+                self.dialog = Some(DialogState::PickFolder {
+                    pane: pane_idx,
+                    sources: vec![entry.path],
+                    is_move: true,
+                    browse_dir: start,
+                });
+            }
+            "copy_to" => {
+                let start = self.panes[pane_idx]
+                    .current_dir()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.primary_root.clone());
+                self.dialog = Some(DialogState::PickFolder {
+                    pane: pane_idx,
+                    sources: vec![entry.path],
+                    is_move: false,
+                    browse_dir: start,
+                });
+            }
+            "rename" => {
+                self.dialog = Some(DialogState::Rename {
+                    target: entry.path,
+                    new_name: entry.name,
+                });
+            }
+            "unzip" => {
+                let stem = entry
+                    .path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Entpackt".to_string());
+                self.dialog = Some(DialogState::ExtractZip {
+                    pane: pane_idx,
+                    zip_path: entry.path,
+                    subfolder_name: stem,
+                    extract_into_subfolder: true,
+                });
+            }
+            "zip" => {
+                self.dialog = Some(DialogState::CompressZip {
+                    pane: pane_idx,
+                    sources: vec![entry.path],
+                    archive_name: format!("{}.zip", entry.name),
+                });
+            }
+            "share" => {
+                if let Err(e) = self.bridge.share_files(&[entry.path]) {
+                    self.show_toast(e, true);
+                }
+            }
+            "inspect" => {
+                self.panes[pane_idx].selected.clear();
+                self.panes[pane_idx].selected.insert(entry.path);
+                self.prefs.show_inspector = true;
+                self.save_prefs();
+            }
+            "delete" => {
+                self.dialog = Some(DialogState::ConfirmDelete {
+                    pane: pane_idx,
+                    targets: vec![entry.path],
+                    permanent: false,
+                });
+            }
+            _ => {}
         }
     }
 
@@ -2561,59 +2757,12 @@ impl TabManagerApp {
         }
     }
 
-    fn draw_entry_context_menu(
-        &self,
-        ui: &mut egui::Ui,
-        entry: &FileEntry,
-        p: &Palette,
-        out: &mut Option<(String, FileEntry)>,
-    ) {
-        if pill_button(ui, Icon::ExternalOpen, "Öffnen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
-            *out = Some(("open".into(), entry.clone()));
-            ui.close();
-        }
-        if !entry.is_dir && pill_button(ui, Icon::ExternalOpen, "Mit anderer App", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
-            *out = Some(("open_ext".into(), entry.clone()));
-            ui.close();
-        }
-        if pill_button(ui, Icon::Copy, "Kopieren", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
-            *out = Some(("copy".into(), entry.clone()));
-            ui.close();
-        }
-        if pill_button(ui, Icon::Cut, "Ausschneiden", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
-            *out = Some(("cut".into(), entry.clone()));
-            ui.close();
-        }
-        if pill_button(ui, Icon::Rename, "Umbenennen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
-            *out = Some(("rename".into(), entry.clone()));
-            ui.close();
-        }
-        if entry.is_zip() && pill_button(ui, Icon::Unzip, "ZIP entpacken…", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
-            *out = Some(("unzip".into(), entry.clone()));
-            ui.close();
-        }
-        if pill_button(ui, Icon::ZipAdd, "In ZIP packen…", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
-            *out = Some(("zip".into(), entry.clone()));
-            ui.close();
-        }
-        if !entry.is_dir && pill_button(ui, Icon::Share, "Teilen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(190.0)).clicked() {
-            *out = Some(("share".into(), entry.clone()));
-            ui.close();
-        }
-        ui.separator();
-        if pill_button(ui, Icon::Trash, "Löschen", Color32::TRANSPARENT, p.danger_soft, p.danger, Some(190.0)).clicked() {
-            *out = Some(("delete".into(), entry.clone()));
-            ui.close();
-        }
-    }
-
-    fn draw_floating_selection_bar(
+    fn draw_selection_action_bar(
         &mut self,
-        ctx: &egui::Context,
+        ui: &mut egui::Ui,
         pane_idx: usize,
         p: &Palette,
         is_dual: bool,
-        bot_pad: f32,
     ) {
         let selected_entries = self.panes[pane_idx].selected_entries();
         let selected_paths: Vec<PathBuf> = selected_entries.iter().map(|e| e.path.clone()).collect();
@@ -2621,145 +2770,124 @@ impl TabManagerApp {
         let other_pane = 1 - pane_idx;
         let other_dir = self.panes[other_pane].current_dir().map(Path::to_path_buf);
 
-        let y_offset = if !self.clipboard.is_empty() {
-            -(78.0 + bot_pad)
-        } else {
-            -(20.0 + bot_pad)
-        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!("{count} ausgewählt"))
+                    .size(14.0)
+                    .strong()
+                    .color(p.accent),
+            );
 
-        egui::Area::new(egui::Id::NULL.with("floating_selection_bar"))
-            .anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(0.0, y_offset))
-            .show(ctx, |ui| {
-                Frame::NONE
-                    .fill(p.bg_floating)
-                    .corner_radius(CornerRadius::same(18))
-                    .stroke(Stroke::new(1.0, p.accent))
-                    .shadow(Shadow {
-                        offset: [0, 8],
-                        blur: 24,
-                        spread: 0,
-                        color: Color32::from_black_alpha(120),
-                    })
-                    .inner_margin(Margin::symmetric(14, 8))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("{count} ausgew."))
-                                    .size(13.5)
-                                    .strong()
-                                    .color(p.accent),
-                            );
+            if ui.button("Alle").clicked() {
+                let all: Vec<PathBuf> = self.panes[pane_idx]
+                    .entries
+                    .iter()
+                    .map(|e| e.path.clone())
+                    .collect();
+                self.panes[pane_idx].selected.extend(all);
+            }
+            if ui.button("Abwählen").clicked() {
+                self.panes[pane_idx].selected.clear();
+            }
 
-                            if ui.button("Alle").clicked() {
-                                let all: Vec<PathBuf> = self.panes[pane_idx]
-                                    .entries
-                                    .iter()
-                                    .map(|e| e.path.clone())
-                                    .collect();
-                                self.panes[pane_idx].selected.extend(all);
-                            }
+            ui.separator();
 
-                            ui.separator();
+            if pill_button(ui, Icon::Copy, "Kopieren", p.bg_surface, p.bg_hover, p.text_primary, None).clicked() {
+                self.clipboard = ClipboardState {
+                    paths: selected_paths.clone(),
+                    action: Some(ClipboardAction::Copy),
+                };
+                self.panes[pane_idx].selected.clear();
+                self.show_toast(format!("{count} Element(e) zum Kopieren gemerkt"), false);
+            }
+            if pill_button(ui, Icon::Cut, "Verschieben", p.bg_surface, p.bg_hover, p.text_primary, None).clicked() {
+                self.clipboard = ClipboardState {
+                    paths: selected_paths.clone(),
+                    action: Some(ClipboardAction::Move),
+                };
+                self.panes[pane_idx].selected.clear();
+                self.show_toast(format!("{count} Element(e) zum Verschieben gemerkt"), false);
+            }
+            if pill_button(ui, Icon::Folder, "In Ordner…", p.accent_soft, p.accent, p.text_primary, None).clicked() {
+                let start = self.panes[pane_idx]
+                    .current_dir()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.primary_root.clone());
+                self.dialog = Some(DialogState::PickFolder {
+                    pane: pane_idx,
+                    sources: selected_paths.clone(),
+                    is_move: true,
+                    browse_dir: start,
+                });
+            }
 
-                            if pill_button(ui, Icon::Copy, "Kopieren", Color32::TRANSPARENT, p.bg_hover, p.text_primary, None).clicked() {
-                                self.clipboard = ClipboardState {
-                                    paths: selected_paths.clone(),
-                                    action: Some(ClipboardAction::Copy),
-                                };
-                                self.panes[pane_idx].selected.clear();
-                                self.show_toast(format!("{count} Element(e) zum Kopieren gemerkt"), false);
-                            }
-                            if pill_button(ui, Icon::Cut, "Verschieben", Color32::TRANSPARENT, p.bg_hover, p.text_primary, None).clicked() {
-                                self.clipboard = ClipboardState {
-                                    paths: selected_paths.clone(),
-                                    action: Some(ClipboardAction::Move),
-                                };
-                                self.panes[pane_idx].selected.clear();
-                                self.show_toast(format!("{count} Element(e) zum Verschieben gemerkt"), false);
-                            }
+            if is_dual {
+                if let Some(dst) = &other_dir {
+                    if pill_button(ui, Icon::Transfer, "→ Kopieren", p.bg_surface, p.accent_soft, p.cyan, None).clicked() {
+                        self.panes[pane_idx].selected.clear();
+                        self.start_copy_or_move(selected_paths.clone(), dst.clone(), false);
+                    }
+                    if pill_button(ui, Icon::Transfer, "→ Verschieben", p.bg_surface, p.accent_soft, p.cyan, None).clicked() {
+                        self.panes[pane_idx].selected.clear();
+                        self.start_copy_or_move(selected_paths.clone(), dst.clone(), true);
+                    }
+                }
+            }
 
-                            if is_dual {
-                                if let Some(dst) = &other_dir {
-                                    if pill_button(ui, Icon::Transfer, "→ Kopieren", p.accent_soft, p.accent, p.text_primary, None).clicked() {
-                                        self.panes[pane_idx].selected.clear();
-                                        self.start_copy_or_move(selected_paths.clone(), dst.clone(), false);
-                                    }
-                                    if pill_button(ui, Icon::Transfer, "→ Verschieben", p.accent_soft, p.accent, p.text_primary, None).clicked() {
-                                        self.panes[pane_idx].selected.clear();
-                                        self.start_copy_or_move(selected_paths.clone(), dst.clone(), true);
-                                    }
-                                }
-                            }
-
-                            if count == 1 {
-                                let single = &selected_entries[0];
-                                if pill_button(ui, Icon::Rename, "Umbenennen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, None).clicked() {
-                                    self.dialog = Some(DialogState::Rename {
-                                        target: single.path.clone(),
-                                        new_name: single.name.clone(),
-                                    });
-                                }
-                                if single.is_zip() && pill_button(ui, Icon::Unzip, "Entpacken", Color32::TRANSPARENT, p.bg_hover, p.cyan, None).clicked() {
-                                    let stem = single
-                                        .path
-                                        .file_stem()
-                                        .map(|s| s.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| "Entpackt".to_string());
-                                    self.dialog = Some(DialogState::ExtractZip {
-                                        pane: pane_idx,
-                                        zip_path: single.path.clone(),
-                                        subfolder_name: stem,
-                                        extract_into_subfolder: true,
-                                    });
-                                }
-                            }
-
-                            if pill_button(ui, Icon::ZipAdd, "ZIP", Color32::TRANSPARENT, p.bg_hover, p.text_primary, None).clicked() {
-                                let default_name = if count == 1 {
-                                    format!("{}.zip", selected_entries[0].name)
-                                } else {
-                                    "Archiv.zip".to_string()
-                                };
-                                self.dialog = Some(DialogState::CompressZip {
-                                    pane: pane_idx,
-                                    sources: selected_paths.clone(),
-                                    archive_name: default_name,
-                                });
-                            }
-
-                            if selected_entries.iter().all(|e| !e.is_dir)
-                                && pill_button(ui, Icon::Share, "Teilen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, None).clicked()
-                            {
-                                if let Err(e) = self.bridge.share_files(&selected_paths) {
-                                    self.show_toast(e, true);
-                                }
-                            }
-
-                            if pill_button(ui, Icon::Trash, "Löschen", p.danger_soft, p.danger, p.danger, None).clicked() {
-                                self.dialog = Some(DialogState::ConfirmDelete {
-                                    pane: pane_idx,
-                                    targets: selected_paths.clone(),
-                                    permanent: false,
-                                });
-                            }
-
-                            if icon_button(
-                                ui,
-                                Icon::Close,
-                                false,
-                                true,
-                                p.bg_hover,
-                                p.accent_soft,
-                                p.text_muted,
-                                p.text_primary,
-                            )
-                            .clicked()
-                            {
-                                self.panes[pane_idx].selected.clear();
-                            }
-                        });
+            if count == 1 {
+                let single = &selected_entries[0];
+                if pill_button(ui, Icon::Rename, "Umbenennen", p.bg_surface, p.bg_hover, p.text_primary, None).clicked() {
+                    self.dialog = Some(DialogState::Rename {
+                        target: single.path.clone(),
+                        new_name: single.name.clone(),
                     });
-            });
+                }
+                if single.is_zip()
+                    && pill_button(ui, Icon::Unzip, "Entpacken", p.bg_surface, p.bg_hover, p.cyan, None).clicked()
+                {
+                    let stem = single
+                        .path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Entpackt".to_string());
+                    self.dialog = Some(DialogState::ExtractZip {
+                        pane: pane_idx,
+                        zip_path: single.path.clone(),
+                        subfolder_name: stem,
+                        extract_into_subfolder: true,
+                    });
+                }
+            }
+
+            if pill_button(ui, Icon::ZipAdd, "In ZIP", p.bg_surface, p.bg_hover, p.text_primary, None).clicked() {
+                let default_name = if count == 1 {
+                    format!("{}.zip", selected_entries[0].name)
+                } else {
+                    "Archiv.zip".to_string()
+                };
+                self.dialog = Some(DialogState::CompressZip {
+                    pane: pane_idx,
+                    sources: selected_paths.clone(),
+                    archive_name: default_name,
+                });
+            }
+
+            if selected_entries.iter().all(|e| !e.is_dir)
+                && pill_button(ui, Icon::Share, "Teilen", p.bg_surface, p.bg_hover, p.text_primary, None).clicked()
+            {
+                if let Err(e) = self.bridge.share_files(&selected_paths) {
+                    self.show_toast(e, true);
+                }
+            }
+
+            if pill_button(ui, Icon::Trash, "Löschen", p.danger_soft, p.danger, p.danger, None).clicked() {
+                self.dialog = Some(DialogState::ConfirmDelete {
+                    pane: pane_idx,
+                    targets: selected_paths.clone(),
+                    permanent: false,
+                });
+            }
+        });
     }
 
     fn draw_clipboard_bar(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -2982,6 +3110,14 @@ impl TabManagerApp {
                 DialogState::ExtractZip { .. } => "ZIP entpacken",
                 DialogState::ConfirmDelete { .. } => "Löschen bestätigen",
                 DialogState::ConfirmEmptyTrash => "Papierkorb leeren",
+                DialogState::ContextSheet { entry, .. } => entry.name.as_str(),
+                DialogState::PickFolder { is_move, .. } => {
+                    if *is_move {
+                        "Zielordner zum Verschieben wählen"
+                    } else {
+                        "Zielordner zum Kopieren wählen"
+                    }
+                }
             })
             .collapsible(false)
             .resizable(false)
@@ -3188,6 +3324,209 @@ impl TabManagerApp {
                                     app.refresh_all_panes();
                                 }
                                 Err(e) => app.show_toast(e, true),
+                            }));
+                        }
+                        if ui.button("Abbrechen").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                DialogState::ContextSheet { pane, entry } => {
+                    let pane_i = *pane;
+                    let ent = entry.clone();
+                    let ctx_clone = ctx.clone();
+                    let w = 360.0;
+
+                    ui.horizontal(|ui| {
+                        category_icon_badge(
+                            ui,
+                            ent.category,
+                            40.0,
+                            Palette::category_color(ent.category),
+                        );
+                        ui.add_space(6.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(&ent.name)
+                                    .size(15.0)
+                                    .strong()
+                                    .color(p.text_primary),
+                            );
+                            let info = if ent.is_dir {
+                                format!("Ordner • {} Elemente", ent.child_count.unwrap_or(0))
+                            } else {
+                                format!(
+                                    "{} • {}",
+                                    format_size(ent.size),
+                                    format_timestamp(ent.modified_secs)
+                                )
+                            };
+                            ui.label(RichText::new(info).size(12.0).color(p.text_muted));
+                        });
+                    });
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    let mut chosen: Option<&'static str> = None;
+                    if pill_button(ui, Icon::ExternalOpen, "Öffnen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(w)).clicked() {
+                        chosen = Some("open");
+                    }
+                    if !ent.is_dir
+                        && pill_button(ui, Icon::ExternalOpen, "Mit anderer App öffnen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(w)).clicked()
+                    {
+                        chosen = Some("open_ext");
+                    }
+                    if pill_button(ui, Icon::Folder, "In anderen Ordner verschieben…", Color32::TRANSPARENT, p.bg_hover, p.cyan, Some(w)).clicked() {
+                        chosen = Some("move_to");
+                    }
+                    if pill_button(ui, Icon::Copy, "In anderen Ordner kopieren…", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(w)).clicked() {
+                        chosen = Some("copy_to");
+                    }
+                    if pill_button(ui, Icon::Copy, "In Zwischenablage kopieren", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(w)).clicked() {
+                        chosen = Some("copy");
+                    }
+                    if pill_button(ui, Icon::Cut, "Ausschneiden", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(w)).clicked() {
+                        chosen = Some("cut");
+                    }
+                    if pill_button(ui, Icon::Rename, "Umbenennen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(w)).clicked() {
+                        chosen = Some("rename");
+                    }
+                    if ent.is_zip()
+                        && pill_button(ui, Icon::Unzip, "ZIP entpacken…", Color32::TRANSPARENT, p.bg_hover, p.cyan, Some(w)).clicked()
+                    {
+                        chosen = Some("unzip");
+                    }
+                    if pill_button(ui, Icon::ZipAdd, "In ZIP komprimieren…", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(w)).clicked() {
+                        chosen = Some("zip");
+                    }
+                    if !ent.is_dir
+                        && pill_button(ui, Icon::Share, "Teilen", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(w)).clicked()
+                    {
+                        chosen = Some("share");
+                    }
+                    if pill_button(ui, Icon::Info, "Details & Eigenschaften", Color32::TRANSPARENT, p.bg_hover, p.text_primary, Some(w)).clicked() {
+                        chosen = Some("inspect");
+                    }
+                    ui.separator();
+                    if pill_button(ui, Icon::Trash, "Löschen", p.danger_soft, p.danger, p.danger, Some(w)).clicked() {
+                        chosen = Some("delete");
+                    }
+                    ui.add_space(6.0);
+                    if ui.button("Schließen").clicked() {
+                        close = true;
+                    }
+
+                    if let Some(act) = chosen {
+                        close = true;
+                        action = Some(Box::new(move |app| {
+                            app.execute_entry_action(pane_i, act, ent, &ctx_clone);
+                        }));
+                    }
+                }
+                DialogState::PickFolder {
+                    pane,
+                    sources,
+                    is_move,
+                    browse_dir,
+                } => {
+                    ui.horizontal(|ui| {
+                        let can_up = browse_dir.parent().is_some();
+                        if icon_button(ui, Icon::Up, false, can_up, p.bg_hover, p.accent_soft, p.text_primary, p.accent).clicked() {
+                            if let Some(parent) = browse_dir.parent().map(Path::to_path_buf) {
+                                *browse_dir = parent;
+                            }
+                        }
+                        ui.label(
+                            RichText::new(browse_dir.to_string_lossy())
+                                .size(13.0)
+                                .strong()
+                                .color(p.text_primary),
+                        );
+                    });
+
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(is_move, "Verschieben (statt Kopieren)");
+                    });
+                    ui.separator();
+
+                    // List subdirectories in browse_dir
+                    let subdirs: Vec<PathBuf> = std::fs::read_dir(&*browse_dir)
+                        .ok()
+                        .map(|rd| {
+                            let mut v: Vec<PathBuf> = rd
+                                .flatten()
+                                .map(|e| e.path())
+                                .filter(|path| {
+                                    path.is_dir()
+                                        && !path
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().starts_with('.'))
+                                            .unwrap_or(false)
+                                })
+                                .collect();
+                            v.sort_by_key(|p| {
+                                p.file_name()
+                                    .map(|n| n.to_string_lossy().to_lowercase())
+                                    .unwrap_or_default()
+                            });
+                            v
+                        })
+                        .unwrap_or_default();
+
+                    let mut next_dir: Option<PathBuf> = None;
+                    ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            if subdirs.is_empty() {
+                                ui.label(
+                                    RichText::new("Keine Unterordner")
+                                        .size(12.5)
+                                        .color(p.text_muted),
+                                );
+                            }
+                            for dir in subdirs {
+                                let name = dir
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                if pill_button(
+                                    ui,
+                                    Icon::Folder,
+                                    &name,
+                                    Color32::TRANSPARENT,
+                                    p.bg_hover,
+                                    p.text_primary,
+                                    Some(360.0),
+                                )
+                                .clicked()
+                                {
+                                    next_dir = Some(dir);
+                                }
+                            }
+                        });
+
+                    if let Some(d) = next_dir {
+                        *browse_dir = d;
+                    }
+
+                    ui.add_space(12.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let cta = if *is_move {
+                            "Hierher verschieben"
+                        } else {
+                            "Hierher kopieren"
+                        };
+                        if pill_button(ui, Icon::Check, cta, p.accent, p.accent_hover, Color32::WHITE, None).clicked() {
+                            let pane_i = *pane;
+                            let srcs = sources.clone();
+                            let dst = browse_dir.clone();
+                            let mv = *is_move;
+                            close = true;
+                            action = Some(Box::new(move |app| {
+                                app.panes[pane_i].selected.clear();
+                                app.start_copy_or_move(srcs, dst, mv);
                             }));
                         }
                         if ui.button("Abbrechen").clicked() {
@@ -3475,6 +3814,36 @@ impl TabManagerApp {
     }
 }
 
+fn draw_select_box(ui: &mut egui::Ui, selected: bool, p: &Palette) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
+    let box_rect = Rect::from_center_size(rect.center(), vec2(22.0, 22.0));
+    if selected {
+        ui.painter()
+            .rect_filled(box_rect, CornerRadius::same(6), p.accent);
+        paint_icon(
+            ui.painter(),
+            box_rect.shrink(3.0),
+            Icon::Check,
+            Color32::WHITE,
+        );
+    } else {
+        ui.painter().rect_stroke(
+            box_rect,
+            CornerRadius::same(6),
+            Stroke::new(
+                1.8,
+                if resp.hovered() {
+                    p.accent
+                } else {
+                    p.text_muted
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+    }
+    resp.clicked()
+}
+
 fn truncate_middle(s: &str, max_chars: usize) -> String {
     let count = s.chars().count();
     if count <= max_chars {
@@ -3488,6 +3857,36 @@ fn truncate_middle(s: &str, max_chars: usize) -> String {
 }
 
 impl eframe::App for TabManagerApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        for ev in self.bridge.take_ime_events() {
+            match ev {
+                ImeEvent::Text(s) => raw.events.push(egui::Event::Text(s)),
+                ImeEvent::Backspace => {
+                    for pressed in [true, false] {
+                        raw.events.push(egui::Event::Key {
+                            key: egui::Key::Backspace,
+                            physical_key: None,
+                            pressed,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                    }
+                }
+                ImeEvent::Enter => {
+                    for pressed in [true, false] {
+                        raw.events.push(egui::Event::Key {
+                            key: egui::Key::Enter,
+                            physical_key: None,
+                            pressed,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_async(ctx);
     }
